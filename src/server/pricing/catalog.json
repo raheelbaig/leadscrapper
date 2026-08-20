@@ -1,0 +1,68 @@
+{
+  "version": "2026.08.1",
+  "lastVerified": "2026-08-20",
+  "verified": false,
+  "sourceUrl": "https://developers.google.com/maps/billing-and-pricing/pricing",
+  "stalenessWarnAfterDays": 90,
+  "billingTimezone": "America/Los_Angeles",
+  "_comment": [
+    "EVERY Google billing number in this application lives in this file.",
+    "No price, free allowance, or quota literal may appear in places/, geo/,",
+    "coverage/, search/, or export/ code. Business logic asks the pricing",
+    "service instead: classify(fieldMask), remaining(sku), wouldExceed(sku, n).",
+    "",
+    "The values below are UNVERIFIED starting points. Confirm them against the",
+    "Google Cloud billing page before the first real run and set verified:true.",
+    "Correcting them is a config change, never a code change."
+  ],
+  "safety": {
+    "reserveAbsolute": 50,
+    "reservePercent": 0.05,
+    "reserveMode": "max",
+    "countMode": "success-only"
+  },
+  "skus": {
+    "places-text-search-enterprise": {
+      "label": "Places Text Search (Enterprise)",
+      "tierRank": 3,
+      "freeCallsPerMonth": 1000,
+      "pricePer1000": 35.0
+    },
+    "places-text-search-pro": {
+      "label": "Places Text Search (Pro)",
+      "tierRank": 2,
+      "freeCallsPerMonth": 5000,
+      "pricePer1000": 32.0
+    },
+    "places-text-search-essentials": {
+      "label": "Places Text Search (Essentials)",
+      "tierRank": 1,
+      "freeCallsPerMonth": 10000,
+      "pricePer1000": 0.0
+    },
+    "geocoding-essentials": {
+      "label": "Geocoding",
+      "tierRank": 1,
+      "freeCallsPerMonth": 10000,
+      "pricePer1000": 5.0
+    }
+  },
+  "_fieldTiersComment": [
+    "Maps each field-mask entry to the SKU it forces. Classification is",
+    "data-driven so that adding a field cannot silently change the billing",
+    "tier: one Enterprise field bills the ENTIRE request at Enterprise.",
+    "Phone and website are Enterprise and are both required by the product,",
+    "so every lead-search call is an Enterprise call."
+  ],
+  "fieldTiers": {
+    "places.id": "places-text-search-essentials",
+    "places.displayName": "places-text-search-pro",
+    "places.formattedAddress": "places-text-search-pro",
+    "places.location": "places-text-search-pro",
+    "places.googleMapsUri": "places-text-search-pro",
+    "places.viewport": "places-text-search-pro",
+    "places.nationalPhoneNumber": "places-text-search-enterprise",
+    "places.internationalPhoneNumber": "places-text-search-enterprise",
+    "places.websiteUri": "places-text-search-enterprise"
+  }
+}
