@@ -40,6 +40,18 @@ export const PLACES_FIELD_MASK = [
   "places.googleMapsUri",
 ] as const;
 
+/**
+ * Response-envelope fields. `nextPageToken` is not a per-place data field: it
+ * does not appear on any place object and does not raise the billing tier. It
+ * still has to be named in X-Goog-FieldMask, because the Places API (New)
+ * returns ONLY what the mask asks for -- omit it and pagination silently
+ * becomes impossible rather than failing loudly.
+ */
+export const PLACES_RESPONSE_FIELDS = ["nextPageToken"] as const;
+
+/** The exact `X-Goog-FieldMask` header value sent to Google. */
+export const PLACES_FIELD_MASK_HEADER = [...PLACES_FIELD_MASK, ...PLACES_RESPONSE_FIELDS].join(",");
+
 export const PLACES_TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText";
 export const GEOCODING_URL = "https://maps.googleapis.com/maps/api/geocode/json";
 

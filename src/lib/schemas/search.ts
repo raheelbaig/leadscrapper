@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import { DEFAULT_GRID_CONFIG } from "@/lib/constants";
+import { boundingBoxSchema } from "@/lib/schemas/location";
 
 /**
  * Shared between the create-search form and the API route that receives it.
@@ -38,6 +39,15 @@ export const createSearchSchema = z.object({
     .min(1, "Target at least 1 lead")
     .max(100_000, "That is far beyond what any city lists"),
   gridConfig: gridConfigSchema.default(DEFAULT_GRID_CONFIG),
+  /**
+   * An explicit rectangle for a controlled test run.
+   *
+   * When present it is used ALONE -- the cache, custom-area and fixture
+   * providers are skipped entirely. Falling through to them would let a request
+   * for a small test area silently resolve to the full city bounding box, which
+   * is the one thing a controlled test must never do.
+   */
+  testBbox: boundingBoxSchema.nullish(),
 });
 
 export type CreateSearchInput = z.input<typeof createSearchSchema>;

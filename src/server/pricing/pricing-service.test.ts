@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { PLACES_FIELD_MASK } from "@/lib/constants";
 
-import { getPricingCatalog } from "./catalog.schema";
+import { getPricingCatalog, isCatalogStale } from "./catalog.schema";
 import {
   PricingError,
   classify,
@@ -20,6 +20,9 @@ import {
 } from "./pricing-service";
 
 const catalog = getPricingCatalog();
+
+/** Today as YYYY-MM-DD, so the staleness cases do not rot. */
+const today = () => new Date().toISOString().slice(0, 10);
 
 const ENTERPRISE = "places-text-search-enterprise";
 const PRO = "places-text-search-pro";
@@ -197,12 +200,53 @@ describe("staleness and versioning", () => {
     expect(getVersion()).toMatch(/\S/);
   });
 
-  it("treats an unverified catalog as stale regardless of its age", () => {
+  it("is verified and fresh, so budget decisions rest on confirmed numbers", () => {
+    // Confirmed against the Google Cloud billing account on 2026-08-21. Until
+    // that happened both the pre-flight and the reserve guard refused every
+    // request -- which is what kept the first real call behind a human decision.
     const info = getStalenessInfo();
-    // Guarding the Phase 2 rule: the catalog must NOT be marked verified
-    // without explicit approval, and the UI must keep warning until it is.
-    expect(info.verified).toBe(false);
-    expect(info.stale).toBe(true);
+    expect(info.verified).toBe(true);
+    expect(info.stale).toBe(false);
+    expect(info.ageDays).toBeLessThanOrEqual(info.stalenessWarnAfterDays);
+  });
+
+  it("still treats an unverified catalog as stale, whatever its age", () => {
+    // The rule itself, exercised against a synthetic catalog rather than the
+    // real one -- otherwise verifying the real catalog would delete the test
+    // that proves the rule exists.
+    const freshButUnverified = { ...catalog, verified: false, lastVerified: today() };
+    expect(isCatalogStale(freshButUnverified)).toBe(true);
+
+    const verifiedButAncient = { ...catalog, verified: true, lastVerified: "2020-01-01" };
+    expect(isCatalogStale(verifiedButAncient)).toBe(true);
+
+    expect(isCatalogStale({ ...catalog, verified: true, lastVerified: today() })).toBe(false);
+  });
+
+  it("holds exactly the figures that were verified against Google billing", () => {
+    // Pinned deliberately. These are the numbers the owner confirmed, so any
+    // later drift -- a typo, a half-finished edit, a merge -- fails the build
+    // instead of silently changing what every budget decision is made from.
+    expect(getFreeLimit(ENTERPRISE)).toBe(1000);
+    expect(getPricePer1000(ENTERPRISE)).toBe(35);
+    expect(getFreeLimit(PRO)).toBe(5000);
+    expect(getPricePer1000(PRO)).toBe(32);
+    expect(getFreeLimit(ESSENTIALS)).toBe(10_000);
+    expect(getPricePer1000(ESSENTIALS)).toBe(0);
+    expect(getFreeLimit(GEOCODING)).toBe(10_000);
+    expect(getPricePer1000(GEOCODING)).toBe(5);
+  });
+
+  it("holds the safety configuration that was confirmed alongside them", () => {
+    expect(getBillingTimezone()).toBe("America/Los_Angeles");
+    expect(catalog.safety).toMatchObject({
+      reserveAbsolute: 50,
+      reservePercent: 0.05,
+      reserveMode: "max",
+      countMode: "success-only",
+    });
+    // max(50, 5% of 1,000) = 50 for the SKU that actually runs out first.
+    expect(getReserve(ENTERPRISE)).toBe(50);
   });
 
   it("carries the information the warning UI needs", () => {
