@@ -17,6 +17,8 @@ import {
   latSpanKm,
   lngSpanKm,
   normalizedLocationKey,
+  seedTilePath,
+  seedTileRects,
   splitBboxQuad,
   type BoundingBox,
 } from "./bbox";
@@ -278,5 +280,132 @@ describe("normalized location key", () => {
     expect(normalizedLocationKey("United States", "Texas", "Paris")).not.toBe(
       normalizedLocationKey("France", null, "Paris"),
     );
+  });
+});
+
+describe("seed tile rectangles", () => {
+  const HOUSTON_TEST_BOX = { minLat: 29.69, minLng: -95.45, maxLat: 29.83, maxLng: -95.28 };
+
+  it("produces cols x rows tiles", () => {
+    const tiles = seedTileRects(HOUSTON_TEST_BOX, { cols: 3, rows: 2 });
+    expect(tiles).toHaveLength(6);
+  });
+
+  it("is deterministic", () => {
+    const a = seedTileRects(HOUSTON_TEST_BOX, { cols: 3, rows: 2 });
+    const b = seedTileRects(HOUSTON_TEST_BOX, { cols: 3, rows: 2 });
+    expect(a).toEqual(b);
+  });
+
+  it("covers the parent EXACTLY, with the last edges landing on the maxima", () => {
+    // Interpolating rather than repeatedly adding a step is what guarantees
+    // this. Accumulated float drift would leave a sliver of the rectangle
+    // outside every tile -- unsearched area that no tile is responsible for.
+    const tiles = seedTileRects(HOUSTON_TEST_BOX, { cols: 3, rows: 2 });
+
+    expect(Math.min(...tiles.map((t) => t.minLat))).toBe(HOUSTON_TEST_BOX.minLat);
+    expect(Math.min(...tiles.map((t) => t.minLng))).toBe(HOUSTON_TEST_BOX.minLng);
+    expect(Math.max(...tiles.map((t) => t.maxLat))).toBe(HOUSTON_TEST_BOX.maxLat);
+    expect(Math.max(...tiles.map((t) => t.maxLng))).toBe(HOUSTON_TEST_BOX.maxLng);
+  });
+
+  it("leaves no gap: the tile areas sum to the parent area", () => {
+    const tiles = seedTileRects(HOUSTON_TEST_BOX, { cols: 3, rows: 2 });
+    const summed = tiles.reduce((sum, tile) => sum + bboxAreaKm2(tile), 0);
+
+    // Within the cos(latitude) approximation, which varies slightly by row.
+    expect(summed).toBeCloseTo(bboxAreaKm2(HOUSTON_TEST_BOX), 1);
+  });
+
+  it("leaves no overlap: no two tiles share interior area", () => {
+    const tiles = seedTileRects(HOUSTON_TEST_BOX, { cols: 3, rows: 3 });
+
+    for (let i = 0; i < tiles.length; i += 1) {
+      for (let j = i + 1; j < tiles.length; j += 1) {
+        const a = tiles[i];
+        const b = tiles[j];
+        const overlaps =
+          a.minLat < b.maxLat - 1e-9 &&
+          b.minLat < a.maxLat - 1e-9 &&
+          a.minLng < b.maxLng - 1e-9 &&
+          b.minLng < a.maxLng - 1e-9;
+        expect(overlaps).toBe(false);
+      }
+    }
+  });
+
+  it("makes adjacent tiles share an edge exactly", () => {
+    const tiles = seedTileRects(HOUSTON_TEST_BOX, { cols: 2, rows: 1 });
+    expect(tiles[0].maxLng).toBe(tiles[1].minLng);
+  });
+
+  it("numbers tiles row-major from the south-west corner", () => {
+    const tiles = seedTileRects(HOUSTON_TEST_BOX, { cols: 3, rows: 2 });
+
+    expect(tiles.map((t) => t.index)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(tiles[0]).toMatchObject({ row: 0, col: 0 });
+    expect(tiles[3]).toMatchObject({ row: 1, col: 0 });
+  });
+
+  it("degenerates cleanly to a single tile equal to the parent", () => {
+    const [only] = seedTileRects(HOUSTON_TEST_BOX, { cols: 1, rows: 1 });
+    expect(only).toMatchObject(HOUSTON_TEST_BOX);
+  });
+
+  it("rejects nonsense dimensions", () => {
+    expect(() => seedTileRects(HOUSTON_TEST_BOX, { cols: 0, rows: 2 })).toThrow(
+      InvalidBoundingBoxError,
+    );
+    expect(() => seedTileRects(HOUSTON_TEST_BOX, { cols: 2.5, rows: 2 })).toThrow(
+      InvalidBoundingBoxError,
+    );
+  });
+
+  it("composes with gridDimensions to tile a real test rectangle", () => {
+    // The planned Phase 3B controlled run: ~15.5 x 16.4 km at an 8 km seed edge.
+    const grid = gridDimensions(HOUSTON_TEST_BOX, {
+      seedTileEdgeKm: 8,
+      minSeedTiles: 4,
+      maxSeedTiles: 9,
+    });
+
+    expect(grid).toMatchObject({ cols: 3, rows: 2, tileCount: 6, clamped: false });
+
+    const tiles = seedTileRects(HOUSTON_TEST_BOX, grid);
+    expect(tiles).toHaveLength(6);
+    expect(bboxWidthKm(tiles[0])).toBeCloseTo(grid.tileWidthKm, 2);
+    expect(bboxHeightKm(tiles[0])).toBeCloseTo(grid.tileHeightKm, 2);
+  });
+
+  it("splits into quadrants that stay inside their parent tile", () => {
+    // Subdivision is the same construction one level down, so a child of a seed
+    // tile must never escape it.
+    const [tile] = seedTileRects(HOUSTON_TEST_BOX, { cols: 2, rows: 2 });
+
+    for (const child of splitBboxQuad(tile)) {
+      expect(child.minLat).toBeGreaterThanOrEqual(tile.minLat);
+      expect(child.maxLat).toBeLessThanOrEqual(tile.maxLat);
+      expect(child.minLng).toBeGreaterThanOrEqual(tile.minLng);
+      expect(child.maxLng).toBeLessThanOrEqual(tile.maxLng);
+    }
+  });
+});
+
+describe("seed tile paths", () => {
+  it("zero-pads, so text ordering is also scan ordering", () => {
+    // Postgres sorts `path` as text. Plain ordinals would put "10" before "2"
+    // and silently scramble the order of any grid past nine tiles.
+    const paths = [1, 2, 9, 10, 11, 100].map(seedTilePath);
+
+    expect(paths).toEqual(["001", "002", "009", "010", "011", "100"]);
+    expect([...paths].sort()).toEqual(paths);
+  });
+
+  it("keeps a child sorted immediately after its parent", () => {
+    const parent = seedTilePath(7);
+    const child = `${parent}.sw`;
+    const nextParent = seedTilePath(8);
+
+    expect([nextParent, child, parent].sort()).toEqual([parent, child, nextParent]);
   });
 });

@@ -9,19 +9,29 @@ import { runControlledTick } from "@/server/search/run-controlled-tick";
 /**
  * POST /api/searches/[id]/run
  *
- * Runs ONE bounded tick of the real pipeline: one tile, one page, one billable
- * Google request (plus at most two retries on transient errors).
+ * Runs ONE bounded tick of the real pipeline: up to `maxTilesPerTick` tiles,
+ * each paginated to at most three pages, each page reserved separately and
+ * retried at most `maxAttemptsPerPage` times. Four budgets bound it -- tiles
+ * per tick, calls per tick, calls per SEARCH, and wall-clock -- and whichever
+ * binds first stops the run with the remaining geography still owed.
  *
- * This is the manual trigger for Phase 3A. The cron-driven worker stays off --
+ * NO OPTIONS ARE ACCEPTED. Every limit is read from PHASE_3B_LIMITS on the
+ * server, so nothing the browser sends can widen what a press may spend.
+ *
+ * This is the manual trigger for Phase 3B. The cron-driven worker stays off --
  * `private.worker_config.enabled` is still false, and nothing here changes it.
- * A search runs because a person pressed a button, and it runs exactly once per
- * press.
+ * A search runs because a person pressed a button.
  *
  * A blocked pre-flight returns 409 with the banner text, having made no Google
  * request, taken no lease, and mutated no tile.
  */
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
+/**
+ * A three-page tile costs ~2s of mandated token delay plus the requests
+ * themselves, and the tick gives itself 50s before it pauses. 60s leaves the
+ * runner room to write its final state rather than being cut off mid-report.
+ */
 export const maxDuration = 60;
 
 export async function POST(_request: Request, context: RouteContext<"/api/searches/[id]/run">) {
@@ -33,6 +43,7 @@ export async function POST(_request: Request, context: RouteContext<"/api/search
   const { id } = await context.params;
 
   try {
+    // Deliberately no options: the phase limits are the only limits.
     const result = await runControlledTick({ searchId: id, userId: user.id });
     return NextResponse.json(result, { headers: { "cache-control": "no-store" } });
   } catch (error) {

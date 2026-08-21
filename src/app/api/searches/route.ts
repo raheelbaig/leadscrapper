@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 import { createSearchSchema } from "@/lib/schemas/search";
 import { getCurrentUser } from "@/server/db/server-client";
 import { createSearch } from "@/server/search/create-search";
-import { Phase3aLimitError } from "@/server/search/limits";
+import { PHASE_3B_LIMITS, SearchLimitError } from "@/server/search/limits";
 import { runPreflight } from "@/server/search/preflight";
 
 /**
@@ -48,14 +48,21 @@ export async function POST(request: Request) {
 
   try {
     const created = await createSearch(parsed.data, { userId: user.id });
-    const preflight = await runPreflight();
+
+    // The estimate describes the FIRST tick, which is capped to one tile -- not
+    // the whole grid. Quoting the grid total here would show a number no single
+    // press can spend, and the guaranteed maximum is the per-search budget
+    // regardless.
+    const preflight = await runPreflight({
+      tiles: Math.min(created.grid.tileCount, PHASE_3B_LIMITS.maxTilesPerTick),
+    });
 
     return NextResponse.json(
       { search: created, preflight },
       { status: 201, headers: { "cache-control": "no-store" } },
     );
   } catch (error) {
-    if (error instanceof Phase3aLimitError) {
+    if (error instanceof SearchLimitError) {
       return NextResponse.json(
         { error: error.message, limit: error.limit },
         { status: error.status },

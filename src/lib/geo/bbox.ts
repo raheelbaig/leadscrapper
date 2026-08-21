@@ -253,3 +253,70 @@ export function normalizedLocationKey(
   const norm = (value: string | null | undefined) => (value ?? "").trim().toLowerCase();
   return `${norm(country)}|${norm(state)}|${norm(city)}`;
 }
+
+/** One seed tile: its rectangle, plus where it sits in the grid. */
+export type SeedTileRect = BoundingBox & {
+  /** 0-based, south to north. */
+  row: number;
+  /** 0-based, west to east. */
+  col: number;
+  /** 1-based scan order, row-major from the south-west corner. */
+  index: number;
+};
+
+/**
+ * Lays a cols x rows grid over a rectangle.
+ *
+ * Every edge is computed by interpolating between `min` and `max` rather than
+ * by repeatedly adding a step. That is what makes the last row and column land
+ * EXACTLY on `maxLat` / `maxLng`: the union of the tiles is the parent
+ * rectangle to the bit, with no accumulated float drift for
+ * `verify_search_coverage` to find as a sliver of missing area.
+ *
+ * No gaps and no overlap by construction, which is the same guarantee
+ * `splitBboxQuad` and `public.create_child_tiles()` provide one level down.
+ */
+export function seedTileRects(
+  bbox: BoundingBox,
+  dimensions: { cols: number; rows: number },
+): SeedTileRect[] {
+  assertValidBbox(bbox);
+  const { cols, rows } = dimensions;
+
+  if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1) {
+    throw new InvalidBoundingBoxError("Grid dimensions must be positive integers.");
+  }
+
+  const latAt = (i: number) => bbox.minLat + ((bbox.maxLat - bbox.minLat) * i) / rows;
+  const lngAt = (i: number) => bbox.minLng + ((bbox.maxLng - bbox.minLng) * i) / cols;
+
+  const tiles: SeedTileRect[] = [];
+
+  for (let row = 0; row < rows; row += 1) {
+    for (let col = 0; col < cols; col += 1) {
+      tiles.push({
+        row,
+        col,
+        index: row * cols + col + 1,
+        minLat: latAt(row),
+        maxLat: latAt(row + 1),
+        minLng: lngAt(col),
+        maxLng: lngAt(col + 1),
+      });
+    }
+  }
+
+  return tiles;
+}
+
+/**
+ * A zero-padded materialized path, so `ORDER BY path` is also scan order.
+ *
+ * Plain ordinals sort lexicographically in Postgres, where "10" comes before
+ * "2" -- which would silently scramble the tile order of any grid larger than
+ * nine tiles. Children append a quadrant suffix ("007.sw"), exactly as
+ * `create_child_tiles` builds them.
+ */
+export function seedTilePath(index: number): string {
+  return String(index).padStart(3, "0");
+}

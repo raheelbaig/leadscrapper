@@ -1,8 +1,12 @@
 import "server-only";
 
-import { PLACES_TEXT_SEARCH_URL } from "@/lib/constants";
+import { PAGE_TOKEN_DELAY_MS, PLACES_TEXT_SEARCH_URL } from "@/lib/constants";
 import type { BoundingBox } from "@/lib/geo/bbox";
-import { buildTextSearchRequest, executeTextSearch, type ExecuteOptions } from "@/server/places/client";
+import {
+  buildTextSearchRequest,
+  executeTextSearch,
+  type ExecuteOptions,
+} from "@/server/places/client";
 import { PlacesApiError } from "@/server/places/errors";
 import type { TextSearchResponse } from "@/server/places/schema";
 import {
@@ -12,7 +16,7 @@ import {
   type QuotaClient,
 } from "@/server/quota/quota-service";
 
-import { PHASE_3A_LIMITS } from "./limits";
+import { PHASE_3B_LIMITS } from "./limits";
 
 /**
  * Fetches ONE page of Text Search results for one tile, under budget.
@@ -94,7 +98,14 @@ export async function fetchTilePage(
   args: FetchTilePageArgs,
   options: FetchTilePageOptions = {},
 ): Promise<TilePageResult> {
-  const maxAttempts = options.maxAttempts ?? PHASE_3A_LIMITS.maxAttemptsPerPage;
+  // Clamped, not merely defaulted. A limit that depends on every call site
+  // remembering to pass the right option is the exact class of mistake that
+  // spent this project's first real Google call, so the floor is enforced at
+  // the lowest level that can spend one.
+  const maxAttempts = Math.min(
+    options.maxAttempts ?? PHASE_3B_LIMITS.maxAttemptsPerPage,
+    PHASE_3B_LIMITS.maxAttemptsPerPage,
+  );
   const sleep = options.sleep ?? defaultSleep;
   const db = options.db;
 
@@ -229,5 +240,198 @@ export async function fetchTilePage(
       }),
     callsMade,
     attempts: maxAttempts,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Pagination
+// ---------------------------------------------------------------------------
+
+/**
+ * Walks one tile through its pages: 1, then 2, then 3, and never a 4th.
+ *
+ * Three constraints from Google's contract shape this loop, and every one of
+ * them is a correctness issue rather than a preference:
+ *
+ *   1. A `nextPageToken` needs roughly two seconds before it is usable. Asking
+ *      sooner returns an error, and the error costs a call.
+ *   2. EVERY other request parameter must be identical when a token is
+ *      presented, or Google answers INVALID_ARGUMENT. That is guaranteed here
+ *      structurally: the same `textQuery` and the same `bbox` object are passed
+ *      to every page, and `fetchTilePage` builds its request once and reuses it
+ *      across retries. The page token is the only thing that ever differs.
+ *   3. Each page is a SEPARATE billable call. So each page reserves its own
+ *      budget, through `fetchTilePage` -- there is no such thing as reserving
+ *      once for a tile.
+ *
+ * `onPage` is invoked after every page, before the next one is requested. That
+ * is what makes a tick that dies mid-tile lose at most the single in-flight
+ * page: the pages already fetched are in Postgres, and their leads are already
+ * behind the unique constraint.
+ *
+ * Contains no database calls of its own, which is what lets the whole
+ * pagination path be tested with a fetch stub and nothing else.
+ */
+
+export type TilePageEvent = {
+  /** 0-based. */
+  pageIndex: number;
+  response: TextSearchResponse;
+  httpStatus: number;
+  durationMs: number;
+  /** Billable calls this page spent, retries included. */
+  callsMade: number;
+  attempts: number;
+  /** Did Google offer another page after this one? */
+  tokenPresent: boolean;
+  /** Distinct place ids seen so far in THIS pass over the tile. */
+  cumulativeResults: number;
+  /** Billable calls so far in THIS pass over the tile. */
+  cumulativeCalls: number;
+  cumulativePages: number;
+};
+
+export type PaginateTileArgs = Omit<FetchTilePageArgs, "pageIndex" | "pageToken">;
+
+export type PaginateTileOptions = FetchTilePageOptions & {
+  maxPages?: number;
+  /** Persists a page before the next one is requested. */
+  onPage?: (event: TilePageEvent) => Promise<void>;
+  /** The mandated token delay. Overridable only so tests need not really wait. */
+  pageDelayMs?: number;
+};
+
+export type PaginateTileOutcome =
+  /** Google offered no further token: everything it has was collected. */
+  | "exhausted"
+  /** A token remained when the page ceiling was hit: results are truncated. */
+  | "page-limit"
+  | "quota-denied"
+  | "error";
+
+export type PaginateTileResult = {
+  outcome: PaginateTileOutcome;
+  pagesFetched: number;
+  /** R: DISTINCT place ids across the pages of this pass. */
+  resultsCount: number;
+  /** Billable calls this pass spent, retries included. */
+  callsMade: number;
+  /** True when the tile stopped with results still waiting behind a token. */
+  tokenRemaining: boolean;
+  error: PlacesApiError | null;
+  quota: { remaining: number; period: string } | null;
+  lastHttpStatus: number | null;
+};
+
+export async function paginateTile(
+  args: PaginateTileArgs,
+  options: PaginateTileOptions = {},
+): Promise<PaginateTileResult> {
+  const maxPages = Math.min(
+    options.maxPages ?? PHASE_3B_LIMITS.maxPagesPerTile,
+    PHASE_3B_LIMITS.maxPagesPerTile,
+  );
+  const sleep = options.sleep ?? defaultSleep;
+  const pageDelayMs = options.pageDelayMs ?? PAGE_TOKEN_DELAY_MS;
+
+  /**
+   * A COUNTER, not the deduplication mechanism. The authoritative dedupe is the
+   * unique index on (search_id, place_id), which survives a crash, a resume and
+   * two ticks running back to back; this set exists only so that a place Google
+   * repeats across pages does not inflate R and push an unsaturated tile into
+   * subdivision.
+   */
+  const seen = new Set<string>();
+
+  let pagesFetched = 0;
+  let callsMade = 0;
+  let pageToken: string | null = null;
+  let lastHttpStatus: number | null = null;
+
+  for (let pageIndex = 0; pageIndex < maxPages; pageIndex += 1) {
+    if (pageIndex > 0) {
+      // The token is not usable immediately. This wait is Google's, not ours.
+      await sleep(pageDelayMs);
+    }
+
+    const page = await fetchTilePage({ ...args, pageIndex, pageToken }, options);
+    callsMade += page.callsMade;
+
+    if (page.kind === "quota-denied") {
+      return {
+        outcome: "quota-denied",
+        pagesFetched,
+        resultsCount: seen.size,
+        callsMade,
+        // The page that was refused is still owed, so the tile is not finished.
+        tokenRemaining: pageIndex > 0,
+        error: null,
+        quota: { remaining: page.remaining, period: page.period },
+        lastHttpStatus,
+      };
+    }
+
+    if (page.kind === "error") {
+      return {
+        outcome: "error",
+        pagesFetched,
+        resultsCount: seen.size,
+        callsMade,
+        tokenRemaining: pageIndex > 0,
+        error: page.error,
+        quota: null,
+        lastHttpStatus: page.error.status,
+      };
+    }
+
+    pagesFetched += 1;
+    lastHttpStatus = page.httpStatus;
+
+    for (const place of page.response.places) {
+      seen.add(place.id);
+    }
+
+    const nextToken = page.response.nextPageToken ?? null;
+
+    await options.onPage?.({
+      pageIndex,
+      response: page.response,
+      httpStatus: page.httpStatus,
+      durationMs: page.durationMs,
+      callsMade: page.callsMade,
+      attempts: page.attempts,
+      tokenPresent: Boolean(nextToken),
+      cumulativeResults: seen.size,
+      cumulativeCalls: callsMade,
+      cumulativePages: pagesFetched,
+    });
+
+    if (!nextToken) {
+      return {
+        outcome: "exhausted",
+        pagesFetched,
+        resultsCount: seen.size,
+        callsMade,
+        tokenRemaining: false,
+        error: null,
+        quota: null,
+        lastHttpStatus,
+      };
+    }
+
+    pageToken = nextToken;
+  }
+
+  // The page ceiling stopped us while Google still had more. The tile is
+  // truncated, which is what R4 exists to detect.
+  return {
+    outcome: "page-limit",
+    pagesFetched,
+    resultsCount: seen.size,
+    callsMade,
+    tokenRemaining: true,
+    error: null,
+    quota: null,
+    lastHttpStatus,
   };
 }

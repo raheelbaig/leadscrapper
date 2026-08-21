@@ -15,6 +15,13 @@ import { formatNumber } from "@/lib/format";
  * MAXIMUM -- because an estimate that fits inside the free allowance while the
  * worst case does not is precisely the situation that quietly overspends.
  *
+ * From Phase 3B the guaranteed maximum is usually the per-search CALL BUDGET
+ * rather than the geometry: once a saturated tile can split into four, and each
+ * child into four again, the geometric worst case runs into the thousands from
+ * a rectangle that looks harmless. The geometric figure is still shown, because
+ * quoting only the capped number would hide how far a bug could run before the
+ * cap caught it.
+ *
  * Reads `/api/searches/preflight`, which reads the counter in Postgres. Nothing
  * here asks Google how much Google quota is left; that would itself be billable.
  */
@@ -26,8 +33,16 @@ export type PreflightPayload = {
     sku: string;
     skuLabel: string;
     tiles: number;
+    pagesPerTile: number;
+    attemptsPerPage: number;
+    maxSubdivisionDepth: number;
     estimatedCalls: number;
+    geometricMaxCalls: number;
+    callBudget: number;
+    callsAlreadySpent: number;
+    callBudgetRemaining: number;
     guaranteedMaxCalls: number;
+    budgetBinds: boolean;
     worstCaseCostUsd: number;
   };
   quota: {
@@ -74,7 +89,7 @@ function Figure({
       <p
         className={
           emphasis
-            ? "text-lg font-semibold tabular-nums text-amber-600 dark:text-amber-400"
+            ? "text-lg font-semibold text-amber-600 tabular-nums dark:text-amber-400"
             : "text-lg font-semibold tabular-nums"
         }
       >
@@ -157,7 +172,8 @@ export function PreflightPanel() {
           </CardTitle>
           <CardDescription>
             {data.estimate.skuLabel} · billing period {data.quota.period} · catalog{" "}
-            {data.pricing.version}
+            {data.pricing.version} · budget {formatNumber(data.estimate.callsAlreadySpent)}/
+            {formatNumber(data.estimate.callBudget)} calls per search
           </CardDescription>
         </CardHeader>
 
@@ -165,12 +181,16 @@ export function PreflightPanel() {
           <Figure
             label="Estimated calls"
             value={formatNumber(data.estimate.estimatedCalls)}
-            hint={`${data.estimate.tiles} tile × 1 page`}
+            hint={`${data.estimate.tiles} tile(s) × ~1.2 pages`}
           />
           <Figure
             label="Guaranteed max"
             value={formatNumber(data.estimate.guaranteedMaxCalls)}
-            hint="Including every retry"
+            hint={
+              data.estimate.budgetBinds
+                ? `Call budget — geometry alone permits ${formatNumber(data.estimate.geometricMaxCalls)}`
+                : "Every page, every retry, every subdivision"
+            }
             emphasis={data.worstCaseExceedsQuota}
           />
           <Figure
@@ -197,9 +217,10 @@ export function PreflightPanel() {
               <AlertTitle>The estimate fits, the worst case does not</AlertTitle>
               <AlertDescription>
                 {formatNumber(data.estimate.estimatedCalls)} call(s) expected, but up to{" "}
-                {formatNumber(data.estimate.guaranteedMaxCalls)} if every request has to be retried
-                — more than the {formatNumber(data.quota.remaining)} remaining. The budget guard
-                would stop the run part-way and keep whatever it had already collected.
+                {formatNumber(data.estimate.guaranteedMaxCalls)} if every page is fetched, every
+                request retried and every saturated tile split — more than the{" "}
+                {formatNumber(data.quota.remaining)} remaining. The budget guard would stop the run
+                part-way and keep whatever it had already collected.
               </AlertDescription>
             </Alert>
           </CardContent>

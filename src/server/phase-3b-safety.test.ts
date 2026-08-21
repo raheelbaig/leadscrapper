@@ -3,23 +3,30 @@ import path from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { PLACES_FIELD_MASK, PLACES_FIELD_MASK_HEADER } from "@/lib/constants";
+import {
+  MAX_PAGES,
+  PAGE_SIZE,
+  PLACES_FIELD_MASK,
+  PLACES_FIELD_MASK_HEADER,
+  RESULT_CEILING,
+} from "@/lib/constants";
 
 import { EXTERNAL_PROVIDERS_ENABLED, PERSIST_RESOLVED_LOCATIONS } from "./geo/resolver-config";
 import { getPricingCatalog } from "./pricing/catalog.schema";
-import { classify, isVerified } from "./pricing/pricing-service";
-import { PHASE_3A_LIMITS } from "./search/limits";
+import { classify, getSkuConfig, isVerified } from "./pricing/pricing-service";
+import { PHASE_3B_LIMITS, maxTilesAfterSubdivision } from "./search/limits";
 
 /**
- * The Phase 3A safety envelope, expressed as tests.
+ * The Phase 3B safety envelope, expressed as tests.
  *
- * Phase 3A opens the door to a real Google request for the first time, so the
- * things that must NOT happen are now more interesting than the things that
- * must. Each rule below is checked against the source tree, because a call site
- * that exists can be reached by some path nobody thought of.
+ * Phase 3A opened the door to a real Google request. Phase 3B opens it to many:
+ * three pages per tile, several tiles, recursive subdivision, and retries. The
+ * things that must NOT happen therefore matter more, not less. Each rule below
+ * is checked against the source tree, because a call site that exists can be
+ * reached by some path nobody thought of.
  *
- * Supersedes the Phase 2 zero-calls suite: `fetch` is now legal in exactly one
- * file, and the assertion is that it is still exactly one.
+ * Supersedes the Phase 3A suite. Every prohibition it made is still made here;
+ * only the limit values moved, and they moved deliberately and by approval.
  */
 
 const SRC = path.resolve(process.cwd(), "src");
@@ -50,8 +57,7 @@ const readCode = (file: string) =>
     .replace(/(^|[^:])\/\/.*$/gm, "$1");
 
 /** Test files and the test bootstrap are not application code. */
-const isTest = (file: string) =>
-  file.endsWith(".test.ts") || rel(file).startsWith("src/test/");
+const isTest = (file: string) => file.endsWith(".test.ts") || rel(file).startsWith("src/test/");
 
 /** The single file allowed to name a Google endpoint. */
 const URL_DECLARATION_FILE = "src/lib/constants.ts";
@@ -97,7 +103,9 @@ describe("the API key never reaches the browser", () => {
     const example = readFileSync(path.resolve(process.cwd(), ".env.example"), "utf8");
     const line = example.split(/\r?\n/).find((l) => l.startsWith("GOOGLE_MAPS_API_KEY"));
     // The key must be declared as a blank placeholder, never with a real value.
-    expect(line ?? "GOOGLE_MAPS_API_KEY=").toMatch(/^GOOGLE_MAPS_API_KEY=\s*$|your|placeholder|xxx/i);
+    expect(line ?? "GOOGLE_MAPS_API_KEY=").toMatch(
+      /^GOOGLE_MAPS_API_KEY=\s*$|your|placeholder|xxx/i,
+    );
   });
 
   it("no client-side file imports the server tree", () => {
@@ -170,7 +178,8 @@ describe("no Geocoding call is possible", () => {
 
 describe("no email enrichment happens", () => {
   it("names no email provider anywhere in the source", () => {
-    const providers = /\b(hunter\.io|snov\.io|apollo\.io|clearbit|dropcontact|neverbounce|zerobounce)\b/i;
+    const providers =
+      /\b(hunter\.io|snov\.io|apollo\.io|clearbit|dropcontact|neverbounce|zerobounce)\b/i;
     const offenders = ALL_FILES.filter((file) => !isTest(file) && providers.test(read(file))).map(
       rel,
     );
@@ -181,11 +190,7 @@ describe("no email enrichment happens", () => {
   it("keeps the search path free of enrichment imports", () => {
     // Also enforced by ESLint, but asserted here so the guarantee survives a
     // change to the lint config.
-    const searchRoots = [
-      "src/server/places/",
-      "src/server/search/",
-      "src/server/geo/",
-    ];
+    const searchRoots = ["src/server/places/", "src/server/search/", "src/server/geo/"];
     const offenders = ALL_FILES.filter((file) => {
       const relative = rel(file);
       if (isTest(file)) return false;
@@ -236,33 +241,131 @@ describe("the worker does not start itself", () => {
   });
 });
 
-describe("the Phase 3A limits are at their safe values", () => {
-  it("allows one tile and one page", () => {
-    expect(PHASE_3A_LIMITS.maxSeedTiles).toBe(1);
-    expect(PHASE_3A_LIMITS.maxPagesPerTile).toBe(1);
-  });
-
-  it("caps the test area well below a city", () => {
+describe("the Phase 3B limits are at their approved values", () => {
+  it("allows a small multi-tile grid, not a city", () => {
+    // The controlled band is 4-9 seed tiles.
+    expect(PHASE_3B_LIMITS.maxSeedTiles).toBe(9);
     // Houston's full bbox is roughly 3,700 km2.
-    expect(PHASE_3A_LIMITS.maxAreaKm2).toBeLessThanOrEqual(25);
+    expect(PHASE_3B_LIMITS.maxAreaKm2).toBeLessThanOrEqual(300);
   });
 
-  it("caps the target at a handful of leads", () => {
-    expect(PHASE_3A_LIMITS.maxTargetLeads).toBeLessThanOrEqual(20);
+  it("caps the target inside the controlled band", () => {
+    expect(PHASE_3B_LIMITS.maxTargetLeads).toBeLessThanOrEqual(50);
   });
 
-  it("allows no retries, so a tick can spend at most one call", () => {
-    // Pinned exactly, not as an inequality. "Exactly one Google request" is the
-    // specification for this phase, and it is enforced here rather than at the
-    // call site so that no code path -- route, button or script -- can widen it
-    // by forgetting to pass an option.
-    expect(PHASE_3A_LIMITS.maxAttemptsPerPage).toBe(1);
-    expect(PHASE_3A_LIMITS.maxCallsPerTick).toBe(1);
-    expect(
-      PHASE_3A_LIMITS.maxSeedTiles *
-        PHASE_3A_LIMITS.maxPagesPerTile *
-        PHASE_3A_LIMITS.maxAttemptsPerPage,
-    ).toBe(1);
+  it("paginates to Google's ceiling and no further", () => {
+    // 20 results x 3 pages = 60 per query. No parameter raises it, so asking
+    // for a fourth page would be a wasted billable call.
+    expect(PHASE_3B_LIMITS.maxPagesPerTile).toBe(MAX_PAGES);
+    expect(PAGE_SIZE * PHASE_3B_LIMITS.maxPagesPerTile).toBe(RESULT_CEILING);
+  });
+
+  it("allows a bounded retry, raised deliberately from the Phase 3A cap of 1", () => {
+    expect(PHASE_3B_LIMITS.maxAttemptsPerPage).toBe(3);
+  });
+
+  it("subdivides ONE level in the controlled run", () => {
+    // Depth 1 exercises R4a (a parent splits into four) and R4b (a depth-1
+    // child that saturates is at the floor) while keeping the geometric worst
+    // case two orders of magnitude below what depth 3 permits. The engine
+    // supports the production depth; only this phase is capped.
+    expect(PHASE_3B_LIMITS.maxSubdivisionDepth).toBe(1);
+  });
+
+  it("processes one tile per press, so resume is auditable", () => {
+    expect(PHASE_3B_LIMITS.maxTilesPerTick).toBe(1);
+  });
+
+  it("bounds a whole search with a hard call budget", () => {
+    // THE ceiling for this phase. Geometry alone no longer bounds anything
+    // once subdivision is in play, so a fixed number has to.
+    expect(PHASE_3B_LIMITS.maxCallsPerSearch).toBe(40);
+  });
+
+  it("keeps the budget far below the protected free allowance", () => {
+    // 40 of ~948 remaining. A run that goes completely wrong still cannot spend
+    // a meaningful share of the month.
+    const enterprise = getSkuConfig("places-text-search-enterprise");
+    const protectedRemaining = enterprise.freeCallsPerMonth - enterprise.reserve;
+
+    expect(PHASE_3B_LIMITS.maxCallsPerSearch / protectedRemaining).toBeLessThan(0.05);
+  });
+
+  it("caps one press at exactly what the other limits permit", () => {
+    const perTickCeiling =
+      PHASE_3B_LIMITS.maxTilesPerTick *
+      PHASE_3B_LIMITS.maxPagesPerTile *
+      PHASE_3B_LIMITS.maxAttemptsPerPage;
+
+    expect(perTickCeiling).toBe(9);
+    expect(perTickCeiling).toBeLessThan(PHASE_3B_LIMITS.maxCallsPerSearch);
+    // Pinned to the DERIVED ceiling, not merely above it. Headroom here would
+    // be spending that nothing accounts for the moment the tile cap is raised,
+    // so raising maxTilesPerTick has to come back through this assertion.
+    expect(PHASE_3B_LIMITS.maxCallsPerTick).toBe(perTickCeiling);
+  });
+
+  it("has a geometric worst case the budget genuinely has to cap", () => {
+    // This is the whole reason the budget exists: the geometry alone permits
+    // an order of magnitude more than the budget allows.
+    const geometricMax =
+      maxTilesAfterSubdivision(PHASE_3B_LIMITS.maxSeedTiles, PHASE_3B_LIMITS.maxSubdivisionDepth) *
+      PHASE_3B_LIMITS.maxPagesPerTile *
+      PHASE_3B_LIMITS.maxAttemptsPerPage;
+
+    expect(geometricMax).toBe(9 * 5 * 3 * 3);
+    expect(geometricMax).toBeGreaterThan(PHASE_3B_LIMITS.maxCallsPerSearch * 8);
+  });
+
+  it("gives a tick a wall-clock budget it can finish inside the route timeout", () => {
+    expect(PHASE_3B_LIMITS.maxTickMs).toBeLessThan(60_000);
+  });
+});
+
+describe("the phase limits are structural, not passed at call sites", () => {
+  it("the run route hands the runner no options at all", () => {
+    // The mistake that cost the project's first real Google call was a limit
+    // enforced by remembering to pass an option. Every limit is now read from
+    // PHASE_3B_LIMITS inside the runner, so no route, button or script can
+    // widen one by forgetting.
+    const route = readCode(path.resolve(process.cwd(), "src/app/api/searches/[id]/run/route.ts"));
+
+    expect(route).toMatch(/runControlledTick\(\{\s*searchId: id,\s*userId: user\.id\s*\}\)/);
+    expect(route).not.toMatch(/maxAttempts|maxPages|maxTilesPerTick|maxCallsPer/);
+  });
+
+  it("no API route takes a limit from the request", () => {
+    // Referencing PHASE_3B_LIMITS in a route is fine and expected -- reading a
+    // limit off the parsed request body is not. So the constant references are
+    // removed first, and what is left must mention no limit at all.
+    const routes = ALL_FILES.filter((file) => rel(file).startsWith("src/app/api/"));
+    const offenders = routes
+      .filter((file) => {
+        const withoutConstants = readCode(file).replace(/PHASE_3B_LIMITS\.\w+/g, "");
+        return /maxPages|maxAttempts|maxTilesPerTick|maxCallsPer/.test(withoutConstants);
+      })
+      .map(rel);
+
+    expect(offenders).toEqual([]);
+  });
+
+  it("the create-search schema accepts no execution limit either", () => {
+    // grid_config describes GEOMETRY, which the user may choose. How many pages,
+    // retries or calls a run may spend is not geometry, and is not negotiable.
+    const schema = readCode(path.resolve(process.cwd(), "src/lib/schemas/search.ts"));
+
+    expect(schema).not.toMatch(/maxPagesPerTile|maxAttemptsPerPage|maxCallsPer|maxTilesPerTick/);
+  });
+
+  it("clamps every option against the phase cap rather than trusting it", () => {
+    const runner = readCode(
+      path.resolve(process.cwd(), "src/server/search/run-controlled-tick.ts"),
+    ).replace(/\s+/g, " ");
+
+    for (const limit of ["maxAttemptsPerPage", "maxPagesPerTile", "maxTilesPerTick"]) {
+      // Math.min(option ?? CAP, CAP) -- so an option can only ever lower it.
+      expect(runner).toContain(`?? PHASE_3B_LIMITS.${limit}, PHASE_3B_LIMITS.${limit},`);
+    }
   });
 });
 
@@ -343,7 +446,8 @@ describe("the billing surface has not changed", () => {
 
   it("has no paid mode to switch to", () => {
     const offenders = ALL_FILES.filter(
-      (file) => !isTest(file) && /\b(paidMode|allowPaid|enablePaid|billingEnabled)\b/.test(read(file)),
+      (file) =>
+        !isTest(file) && /\b(paidMode|allowPaid|enablePaid|billingEnabled)\b/.test(read(file)),
     ).map(rel);
 
     expect(offenders).toEqual([]);

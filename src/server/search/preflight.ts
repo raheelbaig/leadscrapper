@@ -1,35 +1,37 @@
 import "server-only";
 
-import { PLACES_FIELD_MASK } from "@/lib/constants";
+import { INITIAL_AVG_PAGES_PER_TILE, PLACES_FIELD_MASK } from "@/lib/constants";
 import type { PricingStatus } from "@/lib/types/usage";
 import * as pricing from "@/server/pricing/pricing-service";
 import { getQuotaSnapshot, type QuotaClient } from "@/server/quota/quota-service";
 
-import { PHASE_3A_LIMITS } from "./limits";
+import { PHASE_3B_LIMITS, maxTilesAfterSubdivision } from "./limits";
 
 /**
  * The pre-flight check every run must pass before a single Google request is
  * made.
  *
- * Two gates, in this order:
+ * Three gates, in this order:
  *
  *   1. PRICING VERIFICATION. Every budget decision in this application is made
  *      from the numbers in the pricing catalog. While those numbers are
- *      unconfirmed, a "you have 950 calls left" is not a fact, it is a guess --
- *      and authorising a billable request on a guess is exactly what the
- *      FREE-ONLY guarantee exists to prevent. This gate is checked BEFORE the
- *      worker lease is taken, so a blocked run leaves no trace to clean up.
+ *      unconfirmed, a "948 calls left" is not a fact, it is a guess -- and
+ *      authorising a billable request on a guess is exactly what the FREE-ONLY
+ *      guarantee exists to prevent. This gate is checked BEFORE the worker
+ *      lease is taken, so a blocked run leaves no trace to clean up.
  *
- *   2. BUDGET. Can the protected free allowance actually absorb the worst case?
+ *   2. THE PER-SEARCH CALL BUDGET. New in Phase 3B, and the gate that does the
+ *      real work now. Pagination, multi-tile grids and subdivision mean the
+ *      geometry alone no longer bounds the cost of a run; a fixed budget does.
  *
- * Neither gate may be bypassed by a flag, a query parameter, or a value sent
+ *   3. FREE QUOTA. Can the protected free allowance absorb what this run wants?
+ *
+ * None of them may be bypassed by a flag, a query parameter, or a value sent
  * from the browser.
  */
 
 export type BlockCode =
-  | "pricing-unverified"
-  | "quota-exhausted"
-  | "quota-insufficient";
+  "pricing-unverified" | "call-budget-spent" | "quota-exhausted" | "quota-insufficient";
 
 export type PreflightBlock = {
   code: BlockCode;
@@ -44,17 +46,37 @@ export type PreflightBlock = {
 export type PreflightEstimate = {
   sku: string;
   skuLabel: string;
+  /** Tiles this run would actually work through -- pending leaves on a resume. */
   tiles: number;
+  pagesPerTile: number;
+  attemptsPerPage: number;
+  maxSubdivisionDepth: number;
   /**
-   * What the run is expected to cost, at one page per tile in Phase 3A.
+   * What the run is expected to cost: tiles x the learned average pages per
+   * tile. An expectation, not a promise.
    */
   estimatedCalls: number;
   /**
-   * The ceiling: tiles x maxPagesPerTile x attempts. Shown as a SEPARATE number
-   * from the estimate, because an estimate that fits while the worst case does
-   * not is the situation that quietly overspends.
+   * What GEOMETRY alone permits: every tile saturating and subdividing all the
+   * way down, every page fetched, every attempt retried. Reported even though
+   * the budget caps it, because quoting only the capped number would hide how
+   * far a bug could run before the cap caught it.
+   */
+  geometricMaxCalls: number;
+  /** The per-search ceiling, cumulative across resumes. */
+  callBudget: number;
+  /** Billable calls this search has already made. */
+  callsAlreadySpent: number;
+  /** What is left of the budget. */
+  callBudgetRemaining: number;
+  /**
+   * The number that actually binds: min(geometry, budget). Shown as a SEPARATE
+   * figure from the estimate, because an estimate that fits while the worst
+   * case does not is the situation that quietly overspends.
    */
   guaranteedMaxCalls: number;
+  /** True when the budget, not the geometry, is what stops the run. */
+  budgetBinds: boolean;
   /** What those calls would cost if they fell outside the free allowance. */
   worstCaseCostUsd: number;
 };
@@ -79,7 +101,7 @@ export type PreflightResult = {
   worstCaseExceedsQuota: boolean;
 };
 
-/** The exact wording required by the Phase 3A specification. */
+/** The exact wording required by the specification. */
 export const PRICING_BLOCK: PreflightBlock = {
   code: "pricing-unverified",
   title: "GOOGLE SEARCH BLOCKED",
@@ -110,25 +132,32 @@ function toPricingStatus(): PricingStatus {
 
 export type PreflightOptions = {
   db?: QuotaClient;
-  /** Defaults to the Phase 3A single tile. */
+  /** Tiles the run will work through. Defaults to a single tile. */
   tiles?: number;
+  pagesPerTile?: number;
   /**
    * Attempts the caller will actually allow per page.
    *
-   * Defaults to the standing Phase 3A ceiling, but a run that caps itself
-   * lower must say so: an estimate is only useful if it describes the run that
-   * is about to happen, not a hypothetical one with a different retry budget.
+   * Taken at FACE VALUE, not clamped. This function describes the run it is
+   * told about; enforcing the phase cap is the runner's job, and the runner
+   * passes its own already-capped number in. Clamping here as well would make
+   * the estimate silently disagree with its caller.
    */
   attemptsPerPage?: number;
+  maxSubdivisionDepth?: number;
+  callBudget?: number;
+  /** `searches.api_calls_run`. */
+  callsAlreadySpent?: number;
 };
 
 export async function runPreflight(options: PreflightOptions = {}): Promise<PreflightResult> {
-  const tiles = options.tiles ?? PHASE_3A_LIMITS.maxSeedTiles;
-  // Taken at face value, NOT clamped. This function describes the run it is
-  // told about; enforcing the phase cap is the runner's job, and it passes its
-  // own already-capped number in. Clamping here as well would make the estimate
-  // silently disagree with a caller that legitimately allows more retries.
-  const attemptsPerPage = options.attemptsPerPage ?? PHASE_3A_LIMITS.maxAttemptsPerPage;
+  const tiles = options.tiles ?? 1;
+  const pagesPerTile = options.pagesPerTile ?? PHASE_3B_LIMITS.maxPagesPerTile;
+  const attemptsPerPage = options.attemptsPerPage ?? PHASE_3B_LIMITS.maxAttemptsPerPage;
+  const maxSubdivisionDepth = options.maxSubdivisionDepth ?? PHASE_3B_LIMITS.maxSubdivisionDepth;
+  const callBudget = options.callBudget ?? PHASE_3B_LIMITS.maxCallsPerSearch;
+  const callsAlreadySpent = Math.max(options.callsAlreadySpent ?? 0, 0);
+  const callBudgetRemaining = Math.max(callBudget - callsAlreadySpent, 0);
 
   // The SKU is DERIVED from the field mask that will actually be sent, never
   // named. Phone and website are Enterprise fields and both are required, so
@@ -137,8 +166,10 @@ export async function runPreflight(options: PreflightOptions = {}): Promise<Pref
   const sku = pricing.classify(PLACES_FIELD_MASK).sku;
   const config = pricing.getSkuConfig(sku);
 
-  const estimatedCalls = tiles * PHASE_3A_LIMITS.maxPagesPerTile;
-  const guaranteedMaxCalls = tiles * PHASE_3A_LIMITS.maxPagesPerTile * attemptsPerPage;
+  const estimatedCalls = Math.ceil(tiles * INITIAL_AVG_PAGES_PER_TILE);
+  const geometricMaxCalls =
+    maxTilesAfterSubdivision(tiles, maxSubdivisionDepth) * pagesPerTile * attemptsPerPage;
+  const guaranteedMaxCalls = Math.min(geometricMaxCalls, callBudgetRemaining);
 
   const snapshot = await getQuotaSnapshot(sku, { db: options.db });
 
@@ -146,8 +177,16 @@ export async function runPreflight(options: PreflightOptions = {}): Promise<Pref
     sku,
     skuLabel: config.label,
     tiles,
+    pagesPerTile,
+    attemptsPerPage,
+    maxSubdivisionDepth,
     estimatedCalls,
+    geometricMaxCalls,
+    callBudget,
+    callsAlreadySpent,
+    callBudgetRemaining,
     guaranteedMaxCalls,
+    budgetBinds: callBudgetRemaining < geometricMaxCalls,
     worstCaseCostUsd: pricing.estimateCost({
       sku,
       calls: guaranteedMaxCalls,
@@ -186,7 +225,27 @@ export async function runPreflight(options: PreflightOptions = {}): Promise<Pref
     };
   }
 
-  // Gate 2: budget.
+  // Gate 2: the per-search budget. Independent of the free allowance -- this is
+  // the phase's own ceiling, and it binds long before Google's does.
+  if (callBudgetRemaining <= 0) {
+    return {
+      allowed: false,
+      blocked: {
+        code: "call-budget-spent",
+        title: "CONTROLLED RUN BUDGET SPENT",
+        message: `This search has made ${callsAlreadySpent} of its ${callBudget} permitted Google calls.`,
+        action:
+          "The controlled Phase 3B budget is deliberately small. Review what the run collected, " +
+          "then raise maxCallsPerSearch in src/server/search/limits.ts if more is genuinely warranted.",
+      },
+      estimate,
+      quota,
+      pricing: pricingStatus,
+      worstCaseExceedsQuota,
+    };
+  }
+
+  // Gate 3: the free allowance.
   if (snapshot.remaining <= 0) {
     return {
       allowed: false,
@@ -209,7 +268,7 @@ export async function runPreflight(options: PreflightOptions = {}): Promise<Pref
       blocked: {
         code: "quota-insufficient",
         title: "NOT ENOUGH FREE QUOTA",
-        message: `This run needs ${estimatedCalls} call(s) but only ${snapshot.remaining} remain in the protected allowance.`,
+        message: `This run needs about ${estimatedCalls} call(s) but only ${snapshot.remaining} remain in the protected allowance.`,
         action: "Wait for the billing month to reset, or reduce the size of the run.",
       },
       estimate,

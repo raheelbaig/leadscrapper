@@ -23,22 +23,31 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { DEFAULT_GRID_CONFIG } from "@/lib/constants";
-import { bboxAreaKm2 } from "@/lib/geo/bbox";
+import { bboxAreaKm2, gridDimensions } from "@/lib/geo/bbox";
 import { createSearchSchema, type CreateSearchInput } from "@/lib/schemas/search";
 
 /**
- * A ~10 km2 rectangle over downtown Houston.
+ * A ~254 km2 rectangle over the Houston inner loop: about 15.5 x 16.4 km.
  *
  * Deliberately NOT the Houston city bounding box, which is roughly 3,700 km2
- * and would plan a 90-tile crawl. Phase 3A proves the pipeline on one small
- * tile, so the default is a neighbourhood.
+ * and would plan a 90-tile crawl. At the 8 km seed edge this box tiles into a
+ * 3 x 2 grid -- six tiles, inside the controlled 4-9 band, and large enough per
+ * tile that pagination to page 2 is actually exercised rather than theorised.
  */
-const DOWNTOWN_HOUSTON_TEST_BOX = {
-  minLat: 29.74,
-  minLng: -95.38,
-  maxLat: 29.77,
-  maxLng: -95.35,
+const HOUSTON_INNER_LOOP_TEST_BOX = {
+  minLat: 29.69,
+  minLng: -95.45,
+  maxLat: 29.83,
+  maxLng: -95.28,
 } as const;
+
+/**
+ * Mirrors PHASE_3B_LIMITS. The server is authoritative and refuses anything
+ * past these on its own; they are repeated here only so the form can warn
+ * before a submission that would be rejected.
+ */
+const PHASE_3B_MAX_AREA_KM2 = 300;
+const PHASE_3B_MAX_SEED_TILES = 9;
 
 function FieldError({ message }: { message?: string }) {
   if (!message) return null;
@@ -64,18 +73,21 @@ export function SearchForm() {
       country: "United States",
       state: "",
       city: "Houston",
-      targetLeads: 5,
+      targetLeads: 40,
       gridConfig: DEFAULT_GRID_CONFIG,
-      testBbox: DOWNTOWN_HOUSTON_TEST_BOX,
+      testBbox: HOUSTON_INNER_LOOP_TEST_BOX,
     },
   });
 
   const stopOnTarget = useWatch({ control, name: "gridConfig.stopOnTargetReached" });
   const testBbox = useWatch({ control, name: "testBbox" });
+  const seedTileEdgeKm = useWatch({ control, name: "gridConfig.seedTileEdgeKm" });
 
-  // Shown live, because the area is the single number that decides how many
-  // tiles -- and therefore how many billable calls -- a search will cost.
-  const areaKm2 = (() => {
+  // Shown live, because the area and the seed edge are the two numbers that
+  // decide how many tiles -- and therefore how many billable calls -- a search
+  // will cost. Computed with the SAME pure functions the server plans with, so
+  // the preview cannot promise a grid the server would build differently.
+  const plan = (() => {
     const box = {
       minLat: Number(testBbox?.minLat),
       minLng: Number(testBbox?.minLng),
@@ -86,7 +98,22 @@ export function SearchForm() {
       Object.values(box).every(Number.isFinite) &&
       box.minLat < box.maxLat &&
       box.minLng < box.maxLng;
-    return valid ? bboxAreaKm2(box) : null;
+
+    if (!valid) return null;
+
+    const edge =
+      Number(seedTileEdgeKm) > 0 ? Number(seedTileEdgeKm) : DEFAULT_GRID_CONFIG.seedTileEdgeKm;
+
+    try {
+      const grid = gridDimensions(box, {
+        seedTileEdgeKm: edge,
+        minSeedTiles: Math.min(DEFAULT_GRID_CONFIG.minSeedTiles, PHASE_3B_MAX_SEED_TILES),
+        maxSeedTiles: PHASE_3B_MAX_SEED_TILES,
+      });
+      return { areaKm2: bboxAreaKm2(box), grid };
+    } catch {
+      return null;
+    }
   })();
 
   async function onSubmit(values: CreateSearchInput) {
@@ -102,8 +129,7 @@ export function SearchForm() {
       if (!response.ok) {
         toast.error("The search could not be created", {
           description:
-            payload.error ??
-            payload.issues?.map((i: { message: string }) => i.message).join(", "),
+            payload.error ?? payload.issues?.map((i: { message: string }) => i.message).join(", "),
         });
         return;
       }
@@ -112,7 +138,7 @@ export function SearchForm() {
       // running it bills. The run is a separate, explicit action on the detail
       // page.
       toast.success("Search created", {
-        description: `${payload.search.areaKm2.toFixed(1)} km² · 1 tile · nothing has been requested from Google yet.`,
+        description: `${payload.search.areaKm2.toFixed(1)} km² · ${payload.search.grid.tileCount} tile(s) · nothing has been requested from Google yet.`,
       });
 
       await queryClient.invalidateQueries({ queryKey: ["searches", "preflight"] });
@@ -127,17 +153,13 @@ export function SearchForm() {
   }
 
   return (
-    <form
-      onSubmit={handleSubmit(onSubmit)}
-      className="space-y-6"
-      noValidate
-    >
+    <form onSubmit={handleSubmit(onSubmit)} className="space-y-6" noValidate>
       <Card>
         <CardHeader>
           <CardTitle>Search</CardTitle>
           <CardDescription>
-            The grid is built from the city&apos;s real bounding box. Your lead target decides when
-            to stop, never how the area is divided.
+            The grid is built from the rectangle alone. Your lead target decides when to stop, never
+            how the area is divided.
           </CardDescription>
         </CardHeader>
 
@@ -207,7 +229,7 @@ export function SearchForm() {
             <FieldError message={errors.targetLeads?.message} />
             <p className="text-muted-foreground text-xs">
               A city may simply not list this many businesses. Reaching full coverage without
-              hitting the target is a useful result, not a failure.
+              hitting the target is a useful result, not a failure. Phase 3B caps this at 50.
             </p>
           </div>
         </CardContent>
@@ -220,8 +242,8 @@ export function SearchForm() {
             Controlled test area
           </CardTitle>
           <CardDescription>
-            Phase 3A searches one small rectangle, not a whole city. The grid is built from this
-            box alone — automatic city resolution needs the Geocoding provider, which is still off.
+            Phase 3B searches a district, not a whole city. The grid is built from this box alone —
+            automatic city resolution needs the Geocoding provider, which is still off.
           </CardDescription>
         </CardHeader>
 
@@ -245,15 +267,21 @@ export function SearchForm() {
             </div>
           </div>
 
-          <FieldError message={errors.testBbox?.minLat?.message ?? errors.testBbox?.minLng?.message} />
+          <FieldError
+            message={errors.testBbox?.minLat?.message ?? errors.testBbox?.minLng?.message}
+          />
 
           <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border p-3">
             <div className="space-y-0.5">
               <p className="text-sm font-medium tabular-nums">
-                {areaKm2 === null ? "Invalid rectangle" : `${areaKm2.toFixed(1)} km²`}
+                {plan === null
+                  ? "Invalid rectangle"
+                  : `${plan.areaKm2.toFixed(1)} km² · ${plan.grid.cols}×${plan.grid.rows} = ${plan.grid.tileCount} seed tile(s)`}
               </p>
               <p className="text-muted-foreground text-xs">
-                One seed tile. The server refuses anything over 25 km² in this phase.
+                {plan === null
+                  ? "Every minimum has to be below its matching maximum."
+                  : `${plan.grid.tileWidthKm.toFixed(2)}×${plan.grid.tileHeightKm.toFixed(2)} km each. The server refuses anything over ${PHASE_3B_MAX_AREA_KM2} km² or ${PHASE_3B_MAX_SEED_TILES} seed tiles in this phase.`}
               </p>
             </div>
             <Button
@@ -261,12 +289,12 @@ export function SearchForm() {
               variant="outline"
               size="sm"
               onClick={() => {
-                for (const [key, value] of Object.entries(DOWNTOWN_HOUSTON_TEST_BOX)) {
+                for (const [key, value] of Object.entries(HOUSTON_INNER_LOOP_TEST_BOX)) {
                   setValue(`testBbox.${key}` as "testBbox.minLat", value, { shouldDirty: true });
                 }
               }}
             >
-              Reset to downtown Houston
+              Reset to the Houston inner loop
             </Button>
           </div>
         </CardContent>
@@ -307,7 +335,7 @@ export function SearchForm() {
                   {...register("gridConfig.maxSubdivisionDepth")}
                 />
                 <p className="text-muted-foreground text-xs">
-                  How many times a saturated tile may split into four.
+                  How many times a saturated tile may split into four. Phase 3B caps this at 1.
                 </p>
               </div>
               <div className="space-y-2">

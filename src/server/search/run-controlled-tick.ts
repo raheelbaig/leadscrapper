@@ -2,76 +2,156 @@ import "server-only";
 
 import { randomUUID } from "node:crypto";
 
-import { RESULT_CEILING } from "@/lib/constants";
+import { DEFAULT_GRID_CONFIG } from "@/lib/constants";
 import type { Json } from "@/lib/database.types";
-import type { BoundingBox } from "@/lib/geo/bbox";
+import { buildCoverageReport, type CoverageReport, type CoverageTile } from "@/lib/coverage-report";
+import { bboxHeightKm, bboxWidthKm, type BoundingBox } from "@/lib/geo/bbox";
+import type { TileState } from "@/lib/tile-states";
 import { getSupabaseAdminClient } from "@/server/db/admin";
+import type { PlacesApiError } from "@/server/places/errors";
 import { mapPlaces } from "@/server/places/lead-mapper";
 
 import { claimSearchById } from "./claim";
+import { classifyTile, type TileClassification } from "./classify-tile";
 import { logSearchEvent } from "./events";
-import { PHASE_3A_LIMITS } from "./limits";
+import { PHASE_3B_LIMITS } from "./limits";
 import { runPreflight, SearchBlockedError, type PreflightResult } from "./preflight";
-import { fetchTilePage, type FetchTilePageOptions } from "./tile-runner";
+import { paginateTile, type PaginateTileOptions } from "./tile-runner";
 
 /**
  * ONE bounded, manually triggered tick of the real pipeline.
  *
- * This is the Phase 3A runner: claim -> one tile -> one page -> map -> dedupe
- * insert -> classify -> release. It is deliberately not the full worker. There
- * is no pagination to pages 2 and 3, no subdivision, and no loop over tiles;
- * those arrive in Phase 3B once this path is known to work against the real API.
+ * Phase 3B walks a grid: claim -> for each tile, pages 1..3 with the mandated
+ * token delay -> map -> dedupe insert -> classify R1-R5 -> subdivide if
+ * saturated -> release. It is still NOT the permanent worker. `private.
+ * worker_config.enabled` is false, no cron job drives this, and a search runs
+ * because a person pressed a button.
  *
  * The order of the first two steps matters and is not an accident:
  *
  *   1. PRE-FLIGHT, before anything is claimed or mutated. A run blocked by the
- *      pricing gate must leave no lease to expire, no tile in `in_progress`,
- *      and no status to clean up -- it simply never started.
+ *      pricing gate, the call budget or the free allowance must leave no lease
+ *      to expire, no tile in `in_progress`, and no status to clean up -- it
+ *      simply never started.
  *   2. CLAIM, which is the mutual-exclusion primitive. Two runners holding the
  *      same search is the only way this design could bill Google twice for one
  *      tile, so nothing after this point runs without the lease.
  *
- * Everything that matters is persisted as it happens. A tick that dies at any
- * point loses at most the single in-flight page, and the tile returns to
- * `pending` on the next run rather than being recorded as covered.
+ * FOUR independent budgets stop the loop, and whichever binds first wins:
+ * tiles per tick, calls per tick, calls per SEARCH (cumulative across every
+ * resume), and wall-clock. The per-search call budget is the one that matters:
+ * with subdivision in play, geometry alone no longer bounds what a run can
+ * spend, so a fixed number has to.
+ *
+ * Everything that matters is persisted as it happens -- after every PAGE, not
+ * every tile. A tick that dies at any point loses at most the single in-flight
+ * page, and the tile returns to `pending` on the next run rather than being
+ * recorded as covered.
+ *
+ * Two columns are deliberately NOT written here. `search_tiles.api_calls` and
+ * `searches.api_calls_run` are owned by `record_api_call()`, which increments
+ * them inside the same statement that appends the audit row; writing them from
+ * here as well would double-count every call. `unique_new_count` is likewise
+ * owned by `insert_leads_dedup`.
  */
 
 export type TickOutcome =
   | "completed"
-  | "paused-page-limit"
+  | "paused-tile-limit"
+  | "paused-call-budget"
+  | "paused-time-limit"
   | "paused-quota"
+  | "paused-tile-error"
   | "failed"
   | "nothing-to-do";
+
+export type TickStopReason =
+  | "coverage_complete"
+  | "target_reached"
+  | "tile_budget_reached"
+  | "call_budget_reached"
+  | "tick_slice_expired"
+  | "quota_exhausted"
+  | "tile_error"
+  | "fatal_api_error"
+  | "lease_lost";
+
+/** What one tile did, for the run summary and the toast. */
+export type TileRunSummary = {
+  tileId: string;
+  tileLabel: string;
+  state: TileState;
+  rule: string | null;
+  reason: string;
+  pagesFetched: number;
+  resultsReceived: number;
+  leadsInserted: number;
+  duplicatesRejected: number;
+  placesRejected: number;
+  apiCalls: number;
+  tokenRemaining: boolean;
+  childrenCreated: number;
+};
 
 export type ControlledTickResult = {
   outcome: TickOutcome;
   searchId: string;
-  tileId: string | null;
-  tileLabel: string | null;
-  tileState: string | null;
   searchStatus: string;
+  stopReason: TickStopReason;
+  tiles: TileRunSummary[];
   /** Billable Google calls made by this tick. */
   apiCalls: number;
-  /** Places in the Google response. */
+  /** Billable calls this search has now made, cumulative across resumes. */
+  apiCallsTotal: number;
+  callBudget: number;
   resultsReceived: number;
-  /** Rows the database accepted as genuinely new. */
   leadsInserted: number;
-  /** Rows the unique constraint rejected as already present. */
   duplicatesRejected: number;
-  /** Places dropped before insert, e.g. no displayName. */
   placesRejected: number;
-  nextPageTokenPresent: boolean;
+  leadsFound: number;
+  targetLeads: number;
+  targetReached: boolean;
   preflight: PreflightResult;
+  coverage: CoverageReport;
   error: string | null;
 };
 
-export type RunControlledTickOptions = FetchTilePageOptions & {
+export type RunControlledTickOptions = PaginateTileOptions & {
   /** Overrides the worker identity; defaults to a fresh uuid per tick. */
   workerId?: string;
   leaseSeconds?: number;
+  /** Never widens the phase cap -- both are clamped by it. */
+  maxTilesPerTick?: number;
+  /** Injected in tests. Defaults to `Date.now`. */
+  now?: () => number;
 };
 
 type AdminDb = ReturnType<typeof getSupabaseAdminClient>;
+
+/** States that still owe work and are picked up by a resume. */
+const RESUMABLE: TileState[] = ["failed", "skipped_quota"];
+
+function readGridConfig(raw: Json | null) {
+  const source =
+    raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+
+  const num = (key: string, fallback: number) =>
+    typeof source[key] === "number" ? (source[key] as number) : fallback;
+  const bool = (key: string, fallback: boolean) =>
+    typeof source[key] === "boolean" ? (source[key] as boolean) : fallback;
+
+  return {
+    // Clamped again on the way out. The row was capped at creation, but a row
+    // written by an earlier phase must not be able to widen this one.
+    maxSubdivisionDepth: Math.min(
+      num("maxSubdivisionDepth", DEFAULT_GRID_CONFIG.maxSubdivisionDepth),
+      PHASE_3B_LIMITS.maxSubdivisionDepth,
+    ),
+    minTileEdgeKm: num("minTileEdgeKm", DEFAULT_GRID_CONFIG.minTileEdgeKm),
+    saturationRatio: num("saturationRatio", DEFAULT_GRID_CONFIG.saturationRatio),
+    stopOnTargetReached: bool("stopOnTargetReached", DEFAULT_GRID_CONFIG.stopOnTargetReached),
+  };
+}
 
 export async function runControlledTick(
   args: { searchId: string; userId: string },
@@ -80,6 +160,7 @@ export async function runControlledTick(
   const db = getSupabaseAdminClient();
   const workerId = options.workerId ?? randomUUID();
   const leaseSeconds = options.leaseSeconds ?? 90;
+  const now = options.now ?? Date.now;
 
   // -----------------------------------------------------------------------
   // 0. The search must exist and must belong to the caller. The service-role
@@ -95,16 +176,49 @@ export async function runControlledTick(
   if (loadError) throw new Error(`Could not load the search: ${loadError.message}`);
   if (!search) throw new Error("Search not found.");
 
+  const gridConfig = readGridConfig(search.grid_config);
+
+  // Every one of these is clamped by the phase cap, so an option cannot widen
+  // it -- and the API route passes no options at all.
+  const maxAttempts = Math.min(
+    options.maxAttempts ?? PHASE_3B_LIMITS.maxAttemptsPerPage,
+    PHASE_3B_LIMITS.maxAttemptsPerPage,
+  );
+  const maxPages = Math.min(
+    options.maxPages ?? PHASE_3B_LIMITS.maxPagesPerTile,
+    PHASE_3B_LIMITS.maxPagesPerTile,
+  );
+  const maxTiles = Math.min(
+    options.maxTilesPerTick ?? PHASE_3B_LIMITS.maxTilesPerTick,
+    PHASE_3B_LIMITS.maxTilesPerTick,
+  );
+
+  const callBudget = PHASE_3B_LIMITS.maxCallsPerSearch;
+  const callsAlreadySpent = search.api_calls_run;
+
   // -----------------------------------------------------------------------
   // 1. PRE-FLIGHT. Before the lease, before any mutation.
   // -----------------------------------------------------------------------
-  // The pre-flight is told the attempt cap this tick will actually enforce, so
-  // its worst case is this run's worst case rather than the standing ceiling.
-  const maxAttempts = Math.min(
-    options.maxAttempts ?? PHASE_3A_LIMITS.maxAttemptsPerPage,
-    PHASE_3A_LIMITS.maxAttemptsPerPage,
-  );
-  const preflight = await runPreflight({ db, attemptsPerPage: maxAttempts });
+  // It is told exactly what this tick will do -- how many tiles it may take,
+  // how many pages, how many attempts, and how much of the budget is left --
+  // so the estimate describes this run rather than a hypothetical one.
+  const { count: owedTiles } = await db
+    .from("search_tiles")
+    .select("id", { count: "exact", head: true })
+    .eq("search_id", args.searchId)
+    .in("state", ["pending", ...RESUMABLE]);
+
+  const tilesThisTick = Math.min(owedTiles ?? 0, maxTiles);
+
+  const preflight = await runPreflight({
+    db,
+    tiles: Math.max(tilesThisTick, 1),
+    pagesPerTile: maxPages,
+    attemptsPerPage: maxAttempts,
+    maxSubdivisionDepth: gridConfig.maxSubdivisionDepth,
+    callBudget,
+    callsAlreadySpent,
+  });
 
   if (!preflight.allowed) {
     await logSearchEvent(db, {
@@ -117,6 +231,7 @@ export async function runControlledTick(
         pricing_version: preflight.pricing.version,
         pricing_verified: preflight.pricing.verified,
         quota_remaining: preflight.quota.remaining,
+        call_budget_remaining: preflight.estimate.callBudgetRemaining,
         api_calls_made: 0,
       },
     });
@@ -152,22 +267,13 @@ export async function runControlledTick(
     );
   }
 
-  const base: ControlledTickResult = {
-    outcome: "nothing-to-do",
-    searchId: args.searchId,
-    tileId: null,
-    tileLabel: null,
-    tileState: null,
-    searchStatus: "running",
-    apiCalls: 0,
-    resultsReceived: 0,
-    leadsInserted: 0,
-    duplicatesRejected: 0,
-    placesRejected: 0,
-    nextPageTokenPresent: false,
-    preflight,
-    error: null,
-  };
+  const startedAt = now();
+  const tiles: TileRunSummary[] = [];
+
+  let callsThisTick = 0;
+  let leadsFound = search.leads_found;
+  let stop: TickStopReason = "coverage_complete";
+  let fatalError: PlacesApiError | null = null;
 
   try {
     // A dead process cannot have completed a tile. Any tile left `in_progress`
@@ -183,7 +289,7 @@ export async function runControlledTick(
       .from("search_tiles")
       .update({ state: "pending", last_reason: "retry on resume", next_page_token: null })
       .eq("search_id", args.searchId)
-      .in("state", ["failed", "skipped_quota"])
+      .in("state", RESUMABLE)
       .select("id");
 
     if (retried && retried.length > 0) {
@@ -196,319 +302,181 @@ export async function runControlledTick(
       });
     }
 
-    const { data: tile } = await db
-      .from("search_tiles")
-      .select("*")
-      .eq("search_id", args.searchId)
-      .eq("state", "pending")
-      .order("path", { ascending: true })
-      .limit(1)
-      .maybeSingle();
-
-    if (!tile) {
-      await finish(db, args.searchId, workerId, "completed", "coverage_complete", null);
-      await logSearchEvent(db, {
-        searchId: args.searchId,
-        level: "info",
-        code: "nothing_to_do",
-        message: "No pending tiles remain.",
-      });
-      return { ...base, outcome: "nothing-to-do", searchStatus: "completed" };
-    }
-
-    const bbox: BoundingBox = {
-      minLat: tile.min_lat,
-      minLng: tile.min_lng,
-      maxLat: tile.max_lat,
-      maxLng: tile.max_lng,
-    };
-
-    // pending -> in_progress. The transition trigger rejects anything illegal,
-    // and the event trigger writes the tile_events row for free.
-    await db
-      .from("search_tiles")
-      .update({
-        state: "in_progress",
-        last_reason: "claimed by controlled tick",
-        started_at: new Date().toISOString(),
-        attempts: tile.attempts + 1,
-      })
-      .eq("id", tile.id)
-      .eq("state", "pending");
-
-    await db.rpc("heartbeat_job", {
-      p_search: args.searchId,
-      p_worker: workerId,
-      p_status_text: "Fetching Google Places…",
-      p_current_tile: tile.id,
-      p_current_page: 1,
-    });
-
-    await logSearchEvent(db, {
-      searchId: args.searchId,
-      level: "info",
-      code: "tile_started",
-      message: `${tile.label}: requesting page 1 for “${search.query_text}”`,
-      meta: { tile_id: tile.id, bbox, page: 1 },
-    });
-
     // -------------------------------------------------------------------
-    // 3. The billable step. Reserve -> request -> record, per attempt.
+    // 3. The tile loop.
     // -------------------------------------------------------------------
-    const page = await fetchTilePage(
-      {
-        sku: search.search_sku,
-        searchId: args.searchId,
-        tileId: tile.id,
-        textQuery: search.query_text,
-        bbox,
-        pageIndex: 0,
-      },
-      { ...options, db, maxAttempts },
-    );
+    for (;;) {
+      const budgetRemaining = callBudget - (callsAlreadySpent + callsThisTick);
 
-    if (page.kind === "quota-denied") {
-      await db
-        .from("search_tiles")
-        .update({
-          state: "skipped_quota",
-          last_reason: "budget guard denied the reservation",
-          api_calls: tile.api_calls + page.callsMade,
-          completed_at: new Date().toISOString(),
-        })
-        .eq("id", tile.id);
-
-      await logSearchEvent(db, {
-        searchId: args.searchId,
-        level: "warn",
-        code: "quota_denied",
-        message: `FREE PLAN LIMIT REACHED — ${tile.label} was not searched. ${page.remaining} calls remain in ${page.period}.`,
-        meta: { tile_id: tile.id, remaining: page.remaining, api_calls_made: page.callsMade },
-      });
-
-      await finish(db, args.searchId, workerId, "paused", "quota_exhausted", null);
-      return {
-        ...base,
-        outcome: "paused-quota",
-        tileId: tile.id,
-        tileLabel: tile.label,
-        tileState: "skipped_quota",
-        searchStatus: "paused",
-        apiCalls: page.callsMade,
-      };
-    }
-
-    if (page.kind === "error") {
-      // R1: an API error after bounded retries. The tile is `failed`, which is
-      // NOT terminal -- it returns to pending on resume, so the area is still
-      // owed work rather than being silently written off.
-      await db
-        .from("search_tiles")
-        .update({
-          state: "failed",
-          last_reason: page.error.logMessage.slice(0, 500),
-          last_error: page.error.logMessage.slice(0, 500),
-          api_calls: tile.api_calls + page.callsMade,
-          pages_fetched: tile.pages_fetched,
-          completed_at: new Date().toISOString(),
-        })
-        .eq("id", tile.id);
-
-      await logSearchEvent(db, {
-        searchId: args.searchId,
-        level: "error",
-        code: "tile_failed",
-        message: `${tile.label}: ${page.error.logMessage}`,
-        meta: {
-          tile_id: tile.id,
-          http_status: page.error.status,
-          google_status: page.error.googleStatus,
-          kind: page.error.kind,
-          retryable: page.error.retryable,
-          attempts: page.attempts,
-          api_calls_made: page.callsMade,
-        },
-      });
-
-      await finish(db, args.searchId, workerId, "failed", "tile_error", page.error.logMessage);
-      return {
-        ...base,
-        outcome: "failed",
-        tileId: tile.id,
-        tileLabel: tile.label,
-        tileState: "failed",
-        searchStatus: "failed",
-        apiCalls: page.callsMade,
-        error: page.error.logMessage,
-      };
-    }
-
-    // -------------------------------------------------------------------
-    // 4. Map and insert. Deduplication is the database's unique constraint on
-    //    (search_id, place_id) -- never an in-memory Set, which would not
-    //    survive a crash, a resume, or two ticks running back to back.
-    // -------------------------------------------------------------------
-    const places = page.response.places;
-    const mapped = mapPlaces(places, { tileLabel: tile.label, queryText: search.query_text });
-
-    let inserted = 0;
-    let received = 0;
-
-    if (mapped.leads.length > 0) {
-      const { data: insertResult, error: insertError } = await db.rpc("insert_leads_dedup", {
-        p_search: args.searchId,
-        p_tile: tile.id,
-        p_leads: mapped.leads as unknown as Json,
-      });
-
-      if (insertError) {
-        throw new Error(`insert_leads_dedup failed: ${insertError.message}`);
+      if (gridConfig.stopOnTargetReached && leadsFound >= search.target_leads) {
+        stop = "target_reached";
+        break;
+      }
+      if (budgetRemaining <= 0) {
+        stop = "call_budget_reached";
+        break;
+      }
+      if (callsThisTick >= PHASE_3B_LIMITS.maxCallsPerTick) {
+        stop = "call_budget_reached";
+        break;
+      }
+      if (tiles.length >= maxTiles) {
+        stop = "tile_budget_reached";
+        break;
+      }
+      if (now() - startedAt >= PHASE_3B_LIMITS.maxTickMs) {
+        stop = "tick_slice_expired";
+        break;
       }
 
-      const row = Array.isArray(insertResult) ? insertResult[0] : null;
-      inserted = row?.inserted ?? 0;
-      received = row?.received ?? mapped.leads.length;
-    }
+      const { data: tile } = await db
+        .from("search_tiles")
+        .select("*")
+        .eq("search_id", args.searchId)
+        .eq("state", "pending")
+        .order("path", { ascending: true })
+        .limit(1)
+        .maybeSingle();
 
-    const duplicatesRejected = Math.max(mapped.leads.length - inserted, 0);
-    const hasToken = Boolean(page.response.nextPageToken);
+      if (!tile) {
+        stop = "coverage_complete";
+        break;
+      }
 
-    if (mapped.rejected.length > 0) {
-      await logSearchEvent(db, {
-        searchId: args.searchId,
-        level: "warn",
-        code: "places_rejected",
-        message: `${mapped.rejected.length} place(s) had no usable name and were not stored.`,
-        meta: { tile_id: tile.id, rejected: mapped.rejected },
+      // The lease is what authorises a Google request. If it was stolen or
+      // released while we worked, stop before spending anything more.
+      const { data: leaseHeld } = await db.rpc("heartbeat_job", {
+        p_search: args.searchId,
+        p_worker: workerId,
+        p_status_text: `${tile.label}: requesting page 1…`,
+        p_current_tile: tile.id,
+        p_current_page: 1,
       });
+
+      if (leaseHeld === false) {
+        stop = "lease_lost";
+        break;
+      }
+
+      const summary = await runOneTile({
+        db,
+        search: {
+          id: args.searchId,
+          sku: search.search_sku,
+          queryText: search.query_text,
+        },
+        tile,
+        gridConfig,
+        workerId,
+        options: { ...options, db, maxAttempts, maxPages },
+      });
+
+      tiles.push(summary.summary);
+      callsThisTick += summary.summary.apiCalls;
+
+      await db.rpc("recompute_search_progress", { p_search: args.searchId });
+
+      const { data: progress } = await db
+        .from("searches")
+        .select("leads_found")
+        .eq("id", args.searchId)
+        .maybeSingle();
+
+      leadsFound = progress?.leads_found ?? leadsFound;
+
+      if (summary.quotaDenied) {
+        stop = "quota_exhausted";
+        break;
+      }
+
+      if (summary.fatal) {
+        // A non-retryable error that reached Google -- a bad key, a rejected
+        // field mask -- is a configuration fault, not a tile fault. It will
+        // reproduce on every remaining tile, so abandoning the whole tick is
+        // what stops the budget being spent collecting identical rejections.
+        fatalError = summary.fatal;
+        stop = "fatal_api_error";
+        break;
+      }
     }
 
     // -------------------------------------------------------------------
-    // 5. Classify the tile.
-    //
-    // Phase 3A can reach only three of the five outcomes, because it fetches a
-    // single page and cannot subdivide:
-    //
-    //   R2  zero results        -> empty          (verified coverage)
-    //   R3  results, no token   -> covered        (Google had nothing more)
-    //   --  results + a token   -> back to PENDING
-    //
-    // That last case is the honest one. A tile with a page token has more
-    // results waiting, so it is NOT covered; and it is not `saturated_floor`
-    // either, because that state means a permanent gap at the size floor and
-    // this is neither permanent nor at the floor. Returning it to `pending`
-    // keeps the coverage debt visible and lets Phase 3B pick it up exactly
-    // where this run stopped.
+    // 4. Report honestly, then release the lease.
     // -------------------------------------------------------------------
-    const resultsCount = places.length;
-    const saturated = resultsCount >= RESULT_CEILING;
-
-    let nextState: "empty" | "covered" | "pending";
-    let reason: string;
-
-    if (resultsCount === 0) {
-      nextState = "empty";
-      reason = "R2: verified empty — Google returned no places for this rectangle";
-    } else if (!hasToken) {
-      nextState = "covered";
-      reason = "R3: covered — Google returned no further page token";
-    } else {
-      nextState = "pending";
-      reason = `Phase 3A single-page limit: a page token remains, so ${saturated ? "the tile is saturated and " : ""}pages 2-3 are still owed`;
-    }
-
-    await db
-      .from("search_tiles")
-      .update({
-        state: nextState,
-        last_reason: reason,
-        results_count: resultsCount,
-        pages_fetched: tile.pages_fetched + 1,
-        token_after_last: hasToken,
-        // Tokens expire quickly. Storing one that will be stale by the next run
-        // would make the tile restart from a token Google has forgotten, so the
-        // tile restarts at page 1 instead.
-        next_page_token: null,
-        api_calls: tile.api_calls + page.callsMade,
-        completed_at: nextState === "pending" ? null : new Date().toISOString(),
-        started_at: nextState === "pending" ? null : tile.started_at,
-      })
-      .eq("id", tile.id);
-
     await db.rpc("recompute_search_progress", { p_search: args.searchId });
+    await db.rpc("verify_search_coverage", { p_search: args.searchId });
+
+    const coverage = await loadCoverage(db, args.searchId, search.target_leads);
+
+    // "No pending tiles left" is not the same as "the area was covered". A
+    // failed or quota-skipped tile leaves the loop with nothing pending while
+    // the geography is still owed, so the reason has to come from what the
+    // grid actually looks like rather than from why the loop exited.
+    if (stop === "coverage_complete" && coverage.owed.tiles > 0) {
+      stop =
+        coverage.byState.failed.tiles > 0
+          ? "tile_error"
+          : coverage.byState.skipped_quota.tiles > 0
+            ? "quota_exhausted"
+            : "tile_budget_reached";
+    }
+
+    const status = finalStatus(stop);
+    const outcome = finalOutcome(stop, tiles.length);
 
     await logSearchEvent(db, {
       searchId: args.searchId,
-      level: "info",
-      code: `tile_${nextState}`,
-      message:
-        `${tile.label}: ${resultsCount} result(s), ${inserted} new lead(s)` +
-        (duplicatesRejected > 0 ? `, ${duplicatesRejected} duplicate(s) rejected by the database` : "") +
-        `. ${reason}`,
+      level: coverage.fullyCovered ? "info" : "warn",
+      code: "coverage_report",
+      message: coverage.summary,
       meta: {
-        tile_id: tile.id,
-        results_count: resultsCount,
-        received,
-        inserted,
-        duplicates_rejected: duplicatesRejected,
-        next_page_token_present: hasToken,
-        api_calls_made: page.callsMade,
-        http_status: page.httpStatus,
-        duration_ms: page.durationMs,
-        pages_fetched: tile.pages_fetched + 1,
-        max_pages_this_phase: PHASE_3A_LIMITS.maxPagesPerTile,
+        stop_reason: stop,
+        tiles_this_tick: tiles.length,
+        api_calls_made: callsThisTick,
+        api_calls_total: callsAlreadySpent + callsThisTick,
+        call_budget: callBudget,
+        leads_found: coverage.leadsFound,
+        target: coverage.target,
+        coverage_pct: Number(coverage.coveragePct.toFixed(2)),
+        area_unsearched_km2: Number(coverage.owed.areaKm2.toFixed(3)),
+        area_permanent_gap_km2: Number(coverage.permanentGap.areaKm2.toFixed(3)),
+        tiles_remaining: coverage.tilesRemaining,
+        fully_covered: coverage.fullyCovered,
       },
     });
 
-    // -------------------------------------------------------------------
-    // 6. Decide how the run ends, then release the lease.
-    // -------------------------------------------------------------------
-    const { data: progress } = await db
-      .from("searches")
-      .select("leads_found, target_leads, tiles_pending")
-      .eq("id", args.searchId)
-      .maybeSingle();
+    const lastError = fatalError ? fatalError.logMessage : null;
+    await finish(db, args.searchId, workerId, status, stop, lastError);
 
-    const leadsFound = progress?.leads_found ?? inserted;
-    const targetReached = leadsFound >= (progress?.target_leads ?? search.target_leads);
-    const pendingRemain = (progress?.tiles_pending ?? 0) > 0;
-
-    let outcome: TickOutcome;
-    let status: "completed" | "paused";
-    let stopReason: string;
-
-    if (targetReached) {
-      outcome = "completed";
-      status = "completed";
-      stopReason = "target_reached";
-    } else if (pendingRemain) {
-      // Not a failure: the phase's own page limit stopped it, and the report
-      // has to say exactly that rather than implying the area is exhausted.
-      outcome = "paused-page-limit";
-      status = "paused";
-      stopReason = "phase_3a_single_page_limit";
-    } else {
-      outcome = "completed";
-      status = "completed";
-      stopReason = "coverage_complete";
-    }
-
-    await db.rpc("verify_search_coverage", { p_search: args.searchId });
-    await finish(db, args.searchId, workerId, status, stopReason, null);
+    const totals = tiles.reduce(
+      (acc, tile) => ({
+        results: acc.results + tile.resultsReceived,
+        inserted: acc.inserted + tile.leadsInserted,
+        duplicates: acc.duplicates + tile.duplicatesRejected,
+        rejected: acc.rejected + tile.placesRejected,
+      }),
+      { results: 0, inserted: 0, duplicates: 0, rejected: 0 },
+    );
 
     return {
-      ...base,
       outcome,
-      tileId: tile.id,
-      tileLabel: tile.label,
-      tileState: nextState,
+      searchId: args.searchId,
       searchStatus: status,
-      apiCalls: page.callsMade,
-      resultsReceived: resultsCount,
-      leadsInserted: inserted,
-      duplicatesRejected,
-      placesRejected: mapped.rejected.length,
-      nextPageTokenPresent: hasToken,
+      stopReason: stop,
+      tiles,
+      apiCalls: callsThisTick,
+      apiCallsTotal: callsAlreadySpent + callsThisTick,
+      callBudget,
+      resultsReceived: totals.results,
+      leadsInserted: totals.inserted,
+      duplicatesRejected: totals.duplicates,
+      placesRejected: totals.rejected,
+      leadsFound: coverage.leadsFound,
+      targetLeads: coverage.target,
+      targetReached: coverage.targetReached,
+      preflight,
+      coverage,
+      error: lastError,
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -518,13 +486,435 @@ export async function runControlledTick(
       level: "error",
       code: "tick_failed",
       message: `The controlled run stopped: ${message}`,
+      meta: { api_calls_made: callsThisTick },
     });
 
     // Always release the lease. A held lease would block every later attempt
-    // until it expired, and the tile is returned to pending by
-    // recover_stalled_tiles on the next run.
+    // until it expired, and any tile left `in_progress` is returned to pending
+    // by recover_stalled_tiles on the next run.
     await finish(db, args.searchId, workerId, "failed", "tick_error", message);
     throw error;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// One tile: pages 1..3, persisted per page, then classified.
+// ---------------------------------------------------------------------------
+
+type TileRow = {
+  id: string;
+  label: string;
+  depth: number;
+  /** Generated column; typed nullable by the generator, never null in practice. */
+  edge_km: number | null;
+  attempts: number;
+  min_lat: number;
+  min_lng: number;
+  max_lat: number;
+  max_lng: number;
+};
+
+async function runOneTile(input: {
+  db: AdminDb;
+  search: { id: string; sku: string; queryText: string };
+  tile: TileRow;
+  gridConfig: ReturnType<typeof readGridConfig>;
+  workerId: string;
+  options: PaginateTileOptions;
+}): Promise<{
+  summary: TileRunSummary;
+  quotaDenied: boolean;
+  fatal: PlacesApiError | null;
+}> {
+  const { db, search, tile, gridConfig, workerId, options } = input;
+
+  const bbox: BoundingBox = {
+    minLat: tile.min_lat,
+    minLng: tile.min_lng,
+    maxLat: tile.max_lat,
+    maxLng: tile.max_lng,
+  };
+
+  // `edge_km` is `greatest(rect_width_km, rect_height_km)` as a generated
+  // column. The fallback recomputes exactly that from the rectangle, so a null
+  // from the type generator can never silently become an edge of 0 -- which
+  // would send every saturated tile to `saturated_floor` as a permanent gap.
+  const edgeKm = tile.edge_km ?? Math.max(bboxWidthKm(bbox), bboxHeightKm(bbox));
+
+  // pending -> in_progress. The transition trigger rejects anything illegal,
+  // and the event trigger writes the tile_events row for free.
+  //
+  // The per-pass counters are RESET here, and that is load-bearing. Page tokens
+  // expire, so an interrupted tile always restarts at page 1 -- and if
+  // `results_count` carried over, a tile that returned 40 results, died, and
+  // returned the same 40 again would read as R = 80 and subdivide an area that
+  // was never saturated. `api_calls` is not reset: those calls really were
+  // spent, and it is owned by record_api_call anyway.
+  //
+  // The `state = pending` predicate makes this a compare-and-swap, and the
+  // result is CHECKED rather than assumed. The search lease should already make
+  // a lost race impossible, but "should" is not the standard for the statement
+  // that stands between here and a billable request: if this tile was not won,
+  // nothing may be spent on it.
+  const { data: claimed, error: claimError } = await db
+    .from("search_tiles")
+    .update({
+      state: "in_progress",
+      last_reason: "claimed by controlled tick",
+      started_at: new Date().toISOString(),
+      attempts: tile.attempts + 1,
+      results_count: 0,
+      pages_fetched: 0,
+      token_after_last: false,
+      next_page_token: null,
+      completed_at: null,
+    })
+    .eq("id", tile.id)
+    .eq("state", "pending")
+    .select("id");
+
+  if (claimError) {
+    throw new Error(`Could not claim ${tile.label}: ${claimError.message}`);
+  }
+
+  if (!claimed || claimed.length === 0) {
+    throw new Error(
+      `${tile.label} was no longer pending when the tick tried to claim it. ` +
+        "Refusing to search a tile this run does not own.",
+    );
+  }
+
+  await logSearchEvent(db, {
+    searchId: search.id,
+    level: "info",
+    code: "tile_started",
+    message: `${tile.label}: requesting page 1 for “${search.queryText}”`,
+    meta: { tile_id: tile.id, bbox, page: 1, depth: tile.depth },
+  });
+
+  let resultsReceived = 0;
+  let leadsInserted = 0;
+  let duplicatesRejected = 0;
+  let placesRejected = 0;
+
+  const pageResult = await paginateTile(
+    {
+      sku: search.sku,
+      searchId: search.id,
+      tileId: tile.id,
+      textQuery: search.queryText,
+      bbox,
+    },
+    {
+      ...options,
+      onPage: async (page) => {
+        // ---- insert, before the next page is requested -------------------
+        // Deduplication is the database's unique constraint on
+        // (search_id, place_id) -- never an in-memory Set, which would not
+        // survive a crash, a resume, or two ticks running back to back.
+        const mapped = mapPlaces(page.response.places, {
+          tileLabel: tile.label,
+          queryText: search.queryText,
+        });
+
+        placesRejected += mapped.rejected.length;
+
+        if (mapped.leads.length > 0) {
+          const { data: insertResult, error: insertError } = await db.rpc("insert_leads_dedup", {
+            p_search: search.id,
+            p_tile: tile.id,
+            p_leads: mapped.leads as unknown as Json,
+          });
+
+          if (insertError) {
+            throw new Error(`insert_leads_dedup failed: ${insertError.message}`);
+          }
+
+          const row = Array.isArray(insertResult) ? insertResult[0] : null;
+          const inserted = row?.inserted ?? 0;
+          leadsInserted += inserted;
+          duplicatesRejected += Math.max(mapped.leads.length - inserted, 0);
+        }
+
+        resultsReceived = page.cumulativeResults;
+
+        // ---- persist the tile's progress ---------------------------------
+        // `next_page_token` stays null on purpose. Tokens expire in about a
+        // minute, so a stored one would be stale by the next run and would make
+        // the tile restart from a token Google has forgotten. `token_after_last`
+        // records that more results EXIST, which is what classification and the
+        // coverage report actually need.
+        await db
+          .from("search_tiles")
+          .update({
+            results_count: page.cumulativeResults,
+            pages_fetched: page.cumulativePages,
+            token_after_last: page.tokenPresent,
+            next_page_token: null,
+          })
+          .eq("id", tile.id);
+
+        await db.rpc("heartbeat_job", {
+          p_search: search.id,
+          p_worker: workerId,
+          p_status_text: `${tile.label}: page ${page.pageIndex + 1} of ${PHASE_3B_LIMITS.maxPagesPerTile}`,
+          p_current_tile: tile.id,
+          p_current_page: page.pageIndex + 1,
+        });
+
+        await logSearchEvent(db, {
+          searchId: search.id,
+          level: "info",
+          code: "page_fetched",
+          message:
+            `${tile.label} page ${page.pageIndex + 1}: ${page.response.places.length} result(s)` +
+            (page.tokenPresent ? ", another page is available" : ", no further pages"),
+          meta: {
+            tile_id: tile.id,
+            page: page.pageIndex + 1,
+            results: page.response.places.length,
+            cumulative_results: page.cumulativeResults,
+            next_page_token_present: page.tokenPresent,
+            http_status: page.httpStatus,
+            duration_ms: page.durationMs,
+            attempts: page.attempts,
+            api_calls_made: page.callsMade,
+          },
+        });
+      },
+    },
+  );
+
+  const base = {
+    tileId: tile.id,
+    tileLabel: tile.label,
+    pagesFetched: pageResult.pagesFetched,
+    resultsReceived,
+    leadsInserted,
+    duplicatesRejected,
+    placesRejected,
+    apiCalls: pageResult.callsMade,
+    tokenRemaining: pageResult.tokenRemaining,
+    childrenCreated: 0,
+  };
+
+  // ---- quota denied ------------------------------------------------------
+  if (pageResult.outcome === "quota-denied") {
+    const reason =
+      pageResult.pagesFetched === 0
+        ? "budget guard denied the reservation before page 1"
+        : `budget guard denied the reservation before page ${pageResult.pagesFetched + 1}; pages ${pageResult.pagesFetched + 1}+ are still owed`;
+
+    await db
+      .from("search_tiles")
+      .update({
+        state: "skipped_quota",
+        last_reason: reason,
+        completed_at: new Date().toISOString(),
+      })
+      .eq("id", tile.id);
+
+    await logSearchEvent(db, {
+      searchId: search.id,
+      level: "warn",
+      code: "quota_denied",
+      message: `FREE PLAN LIMIT REACHED — ${tile.label} was not completed. ${pageResult.quota?.remaining ?? 0} call(s) remain in ${pageResult.quota?.period ?? "this period"}.`,
+      meta: {
+        tile_id: tile.id,
+        remaining: pageResult.quota?.remaining ?? 0,
+        pages_fetched: pageResult.pagesFetched,
+        api_calls_made: pageResult.callsMade,
+      },
+    });
+
+    return {
+      summary: { ...base, state: "skipped_quota", rule: null, reason },
+      quotaDenied: true,
+      fatal: null,
+    };
+  }
+
+  // ---- R1: an API error after bounded retries ----------------------------
+  if (pageResult.outcome === "error" && pageResult.error) {
+    const error = pageResult.error;
+    const reason = `R1: ${error.logMessage}`.slice(0, 500);
+
+    await db
+      .from("search_tiles")
+      .update({
+        state: "failed",
+        last_reason: reason,
+        last_error: error.logMessage.slice(0, 500),
+        completed_at: new Date().toISOString(),
+      })
+      .eq("id", tile.id);
+
+    // Not retryable AND it reached Google: a bad key, a rejected field mask, a
+    // disabled API. Every remaining tile would fail identically.
+    const fatal = !error.retryable && error.reachedGoogle ? error : null;
+
+    await logSearchEvent(db, {
+      searchId: search.id,
+      level: "error",
+      code: fatal ? "tile_failed_fatal" : "tile_failed",
+      message:
+        `${tile.label}: ${error.logMessage}` +
+        (fatal ? " — this will not fix itself, so the run stopped here." : " — retried on resume."),
+      meta: {
+        tile_id: tile.id,
+        http_status: error.status,
+        google_status: error.googleStatus,
+        kind: error.kind,
+        retryable: error.retryable,
+        pages_fetched: pageResult.pagesFetched,
+        api_calls_made: pageResult.callsMade,
+      },
+    });
+
+    return { summary: { ...base, state: "failed", rule: "R1", reason }, quotaDenied: false, fatal };
+  }
+
+  // ---- R2 / R3 / R4a / R4b ----------------------------------------------
+  const classification: TileClassification = classifyTile({
+    resultsCount: pageResult.resultsCount,
+    tokenRemaining: pageResult.tokenRemaining,
+    pagesFetched: pageResult.pagesFetched,
+    depth: tile.depth,
+    edgeKm,
+    maxSubdivisionDepth: gridConfig.maxSubdivisionDepth,
+    minTileEdgeKm: gridConfig.minTileEdgeKm,
+    saturationRatio: gridConfig.saturationRatio,
+  });
+
+  let childrenCreated = 0;
+
+  if (classification.state === "subdivided") {
+    // The RPC performs the in_progress -> subdivided transition ITSELF, so the
+    // state is not touched here. Doing it the other way round would leave four
+    // children overlapping a tile that is still a live leaf -- exactly what
+    // verify_search_coverage flags as a broken grid.
+    const { data: children, error: splitError } = await db.rpc("create_child_tiles", {
+      p_tile: tile.id,
+      p_reason: classification.reason,
+    });
+
+    if (splitError) {
+      throw new Error(`create_child_tiles failed for ${tile.label}: ${splitError.message}`);
+    }
+
+    childrenCreated = typeof children === "number" ? children : 0;
+
+    if (childrenCreated !== 4) {
+      // The RPC is all-or-nothing and already raises on this; asserting here as
+      // well means a future change to it cannot quietly leave a gap in the grid.
+      throw new Error(
+        `create_child_tiles returned ${childrenCreated} children for ${tile.label}, expected 4.`,
+      );
+    }
+  } else {
+    await db
+      .from("search_tiles")
+      .update({
+        state: classification.state,
+        last_reason: classification.reason,
+        completed_at: new Date().toISOString(),
+      })
+      .eq("id", tile.id);
+  }
+
+  await logSearchEvent(db, {
+    searchId: search.id,
+    level: classification.state === "saturated_floor" ? "warn" : "info",
+    code: `tile_${classification.state}`,
+    message:
+      `${tile.label}: ${pageResult.resultsCount} result(s) over ${pageResult.pagesFetched} page(s), ` +
+      `${leadsInserted} new lead(s)` +
+      (duplicatesRejected > 0
+        ? `, ${duplicatesRejected} duplicate(s) rejected by the database`
+        : "") +
+      `. ${classification.reason}`,
+    meta: {
+      tile_id: tile.id,
+      rule: classification.rule,
+      results_count: pageResult.resultsCount,
+      pages_fetched: pageResult.pagesFetched,
+      inserted: leadsInserted,
+      duplicates_rejected: duplicatesRejected,
+      places_rejected: placesRejected,
+      next_page_token_present: pageResult.tokenRemaining,
+      saturated: classification.saturated,
+      children_created: childrenCreated,
+      depth: tile.depth,
+      api_calls_made: pageResult.callsMade,
+      http_status: pageResult.lastHttpStatus,
+    },
+  });
+
+  return {
+    summary: {
+      ...base,
+      state: classification.state,
+      rule: classification.rule,
+      reason: classification.reason,
+      childrenCreated,
+    },
+    quotaDenied: false,
+    fatal: null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+async function loadCoverage(
+  db: AdminDb,
+  searchId: string,
+  target: number,
+): Promise<CoverageReport> {
+  const [{ data: tiles }, { data: search }] = await Promise.all([
+    db.from("search_tiles").select("label, state, area_km2, depth").eq("search_id", searchId),
+    db.from("searches").select("leads_found").eq("id", searchId).maybeSingle(),
+  ]);
+
+  return buildCoverageReport({
+    tiles: (tiles ?? []).map((tile): CoverageTile => ({
+      label: tile.label,
+      state: tile.state as CoverageTile["state"],
+      // Generated column, nullable only in the generated types.
+      area_km2: tile.area_km2 ?? 0,
+      depth: tile.depth,
+    })),
+    target,
+    leadsFound: search?.leads_found ?? 0,
+  });
+}
+
+function finalStatus(stop: TickStopReason): "completed" | "paused" | "failed" {
+  if (stop === "fatal_api_error") return "failed";
+  if (stop === "coverage_complete" || stop === "target_reached") return "completed";
+  return "paused";
+}
+
+function finalOutcome(stop: TickStopReason, tilesProcessed: number): TickOutcome {
+  switch (stop) {
+    case "coverage_complete":
+      return tilesProcessed === 0 ? "nothing-to-do" : "completed";
+    case "target_reached":
+      return "completed";
+    case "quota_exhausted":
+      return "paused-quota";
+    case "call_budget_reached":
+      return "paused-call-budget";
+    case "tile_budget_reached":
+    case "lease_lost":
+      return "paused-tile-limit";
+    case "tick_slice_expired":
+      return "paused-time-limit";
+    case "tile_error":
+      return "paused-tile-error";
+    case "fatal_api_error":
+      return "failed";
   }
 }
 

@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { INITIAL_AVG_PAGES_PER_TILE } from "@/lib/constants";
 import type { QuotaClient } from "@/server/quota/quota-service";
 
-import { PHASE_3A_LIMITS } from "./limits";
+import { PHASE_3B_LIMITS, maxTilesAfterSubdivision } from "./limits";
 import { PRICING_BLOCK, SearchBlockedError, runPreflight } from "./preflight";
 
 const state = vi.hoisted(() => ({ verified: false }));
@@ -79,6 +80,11 @@ describe("the pricing gate", () => {
     expect(result.blocked?.code).toBe("pricing-unverified");
   });
 
+  it("outranks a spent call budget too", async () => {
+    const result = await runPreflight({ db: fakeDb(0), callsAlreadySpent: 999 });
+    expect(result.blocked?.code).toBe("pricing-unverified");
+  });
+
   it("tells the user exactly what to do about it", async () => {
     const result = await runPreflight({ db: fakeDb(0) });
     expect(result.blocked?.action).toMatch(/catalog\.json/);
@@ -92,7 +98,82 @@ describe("the pricing gate", () => {
   });
 });
 
-describe("the budget gate", () => {
+describe("the per-search call budget", () => {
+  it("is what the guaranteed maximum reports once geometry exceeds it", async () => {
+    // Subdivision makes the geometric worst case unbounded in practice. The
+    // budget is the number that actually binds, so it is the number quoted.
+    state.verified = true;
+    const result = await runPreflight({ db: fakeDb(0), tiles: 6 });
+
+    expect(result.estimate.geometricMaxCalls).toBeGreaterThan(PHASE_3B_LIMITS.maxCallsPerSearch);
+    expect(result.estimate.guaranteedMaxCalls).toBe(PHASE_3B_LIMITS.maxCallsPerSearch);
+    expect(result.estimate.budgetBinds).toBe(true);
+  });
+
+  it("still reports the geometric worst case, rather than hiding it", async () => {
+    state.verified = true;
+    const result = await runPreflight({ db: fakeDb(0), tiles: 6 });
+
+    expect(result.estimate.geometricMaxCalls).toBe(
+      maxTilesAfterSubdivision(6, PHASE_3B_LIMITS.maxSubdivisionDepth) *
+        PHASE_3B_LIMITS.maxPagesPerTile *
+        PHASE_3B_LIMITS.maxAttemptsPerPage,
+    );
+  });
+
+  it("shrinks as a search resumes, because the budget is cumulative", async () => {
+    state.verified = true;
+    const fresh = await runPreflight({ db: fakeDb(0), tiles: 6, callsAlreadySpent: 0 });
+    const resumed = await runPreflight({ db: fakeDb(0), tiles: 6, callsAlreadySpent: 30 });
+
+    expect(fresh.estimate.callBudgetRemaining).toBe(PHASE_3B_LIMITS.maxCallsPerSearch);
+    expect(resumed.estimate.callBudgetRemaining).toBe(PHASE_3B_LIMITS.maxCallsPerSearch - 30);
+    expect(resumed.estimate.guaranteedMaxCalls).toBe(PHASE_3B_LIMITS.maxCallsPerSearch - 30);
+  });
+
+  it("blocks the run outright once the budget is spent", async () => {
+    state.verified = true;
+    const result = await runPreflight({
+      db: fakeDb(0),
+      callsAlreadySpent: PHASE_3B_LIMITS.maxCallsPerSearch,
+    });
+
+    expect(result.allowed).toBe(false);
+    expect(result.blocked?.code).toBe("call-budget-spent");
+    expect(result.estimate.callBudgetRemaining).toBe(0);
+    expect(result.estimate.guaranteedMaxCalls).toBe(0);
+  });
+
+  it("blocks on the budget before it looks at the free allowance", async () => {
+    // They are different guarantees. Plenty of free quota is not permission to
+    // exceed the controlled run's own ceiling.
+    state.verified = true;
+    const result = await runPreflight({
+      db: fakeDb(0),
+      callsAlreadySpent: PHASE_3B_LIMITS.maxCallsPerSearch,
+    });
+
+    expect(result.quota.remaining).toBeGreaterThan(100);
+    expect(result.blocked?.code).toBe("call-budget-spent");
+  });
+
+  it("lets geometry win when geometry is the smaller number", async () => {
+    state.verified = true;
+    const result = await runPreflight({
+      db: fakeDb(0),
+      tiles: 1,
+      pagesPerTile: 1,
+      attemptsPerPage: 1,
+      maxSubdivisionDepth: 0,
+    });
+
+    expect(result.estimate.geometricMaxCalls).toBe(1);
+    expect(result.estimate.guaranteedMaxCalls).toBe(1);
+    expect(result.estimate.budgetBinds).toBe(false);
+  });
+});
+
+describe("the free-quota gate", () => {
   it("allows a run once pricing is verified and quota remains", async () => {
     state.verified = true;
     const result = await runPreflight({ db: fakeDb(10) });
@@ -112,20 +193,20 @@ describe("the budget gate", () => {
 
   it("blocks when the estimate does not fit in what is left", async () => {
     state.verified = true;
-    const result = await runPreflight({ db: fakeDb(950), tiles: 100 });
+    const result = await runPreflight({ db: fakeDb(945), tiles: 9 });
 
     expect(result.allowed).toBe(false);
-    expect(result.blocked?.code).toMatch(/quota-(exhausted|insufficient)/);
+    expect(result.blocked?.code).toBe("quota-insufficient");
   });
 
   it("flags a worst case that does not fit even when the estimate does", async () => {
     // The situation that quietly overspends: an estimate inside the allowance
-    // whose retry ceiling is not. `attemptsPerPage` is passed explicitly
-    // because Phase 3A itself allows no retries, and the flag must still work
-    // for the phase that does.
+    // whose ceiling is not.
     state.verified = true;
-    const result = await runPreflight({ db: fakeDb(949), attemptsPerPage: 3 });
+    const result = await runPreflight({ db: fakeDb(948), tiles: 1 });
 
+    expect(result.quota.remaining).toBe(2);
+    expect(result.estimate.estimatedCalls).toBeLessThanOrEqual(2);
     expect(result.allowed).toBe(true);
     expect(result.worstCaseExceedsQuota).toBe(true);
   });
@@ -138,41 +219,47 @@ describe("the estimate", () => {
     expect(result.estimate.sku).toBe("places-text-search-enterprise");
   });
 
-  it("reports the estimate and the worst case as two separate numbers", async () => {
-    const result = await runPreflight({ db: fakeDb(0) });
+  it("expects tiles x the average pages per tile, not the page ceiling", async () => {
+    const result = await runPreflight({ db: fakeDb(0), tiles: 6 });
+    expect(result.estimate.estimatedCalls).toBe(Math.ceil(6 * INITIAL_AVG_PAGES_PER_TILE));
+  });
 
-    expect(result.estimate.estimatedCalls).toBe(
-      PHASE_3A_LIMITS.maxSeedTiles * PHASE_3A_LIMITS.maxPagesPerTile,
-    );
-    expect(result.estimate.guaranteedMaxCalls).toBe(
-      PHASE_3A_LIMITS.maxSeedTiles *
-        PHASE_3A_LIMITS.maxPagesPerTile *
-        PHASE_3A_LIMITS.maxAttemptsPerPage,
-    );
-    // Phase 3A allows no retries, so the two are equal here. The worst case can
-    // never be LOWER than the estimate, whatever the retry budget.
+  it("reports the estimate and the worst case as two separate numbers", async () => {
+    const result = await runPreflight({ db: fakeDb(0), tiles: 6 });
+
+    expect(result.estimate.estimatedCalls).toBeLessThan(result.estimate.guaranteedMaxCalls);
+    // The worst case can never be LOWER than the estimate.
     expect(result.estimate.guaranteedMaxCalls).toBeGreaterThanOrEqual(
       result.estimate.estimatedCalls,
     );
   });
 
-  it("grows the worst case with the retry budget, not with the estimate", async () => {
-    // Tests the formula rather than today's constant, so raising the cap in
-    // Phase 3B cannot silently stop the worst case from being reported.
+  it("grows the geometric worst case with the retry budget, not the estimate", async () => {
+    // Tests the formula rather than today's constant.
     const noRetries = await runPreflight({ db: fakeDb(0), attemptsPerPage: 1 });
-    expect(noRetries.estimate.guaranteedMaxCalls).toBe(noRetries.estimate.estimatedCalls);
-
     const withRetries = await runPreflight({ db: fakeDb(0), attemptsPerPage: 3 });
+
     expect(withRetries.estimate.estimatedCalls).toBe(noRetries.estimate.estimatedCalls);
-    expect(withRetries.estimate.guaranteedMaxCalls).toBeGreaterThan(
-      withRetries.estimate.estimatedCalls,
-    );
+    expect(withRetries.estimate.geometricMaxCalls).toBe(noRetries.estimate.geometricMaxCalls * 3);
   });
 
-  it("keeps Phase 3A to a single tile and a single page", async () => {
-    const result = await runPreflight({ db: fakeDb(0) });
-    expect(result.estimate.tiles).toBe(1);
-    expect(result.estimate.estimatedCalls).toBe(1);
+  it("grows the geometric worst case with subdivision depth", async () => {
+    // The reason a budget exists at all: depth 3 is two orders of magnitude
+    // more expensive than depth 0 from the same rectangle.
+    const flat = await runPreflight({ db: fakeDb(0), tiles: 6, maxSubdivisionDepth: 0 });
+    const deep = await runPreflight({ db: fakeDb(0), tiles: 6, maxSubdivisionDepth: 3 });
+
+    expect(flat.estimate.geometricMaxCalls).toBe(6 * 3 * 3);
+    expect(deep.estimate.geometricMaxCalls).toBe(6 * (1 + 4 + 16 + 64) * 3 * 3);
+    expect(deep.estimate.guaranteedMaxCalls).toBe(PHASE_3B_LIMITS.maxCallsPerSearch);
+  });
+
+  it("describes the run it is told about, without clamping it", async () => {
+    // Describing is this function's job; enforcing is the runner's, and the
+    // runner passes its own already-capped numbers in.
+    const result = await runPreflight({ db: fakeDb(0), tiles: 40, attemptsPerPage: 9 });
+    expect(result.estimate.tiles).toBe(40);
+    expect(result.estimate.attemptsPerPage).toBe(9);
   });
 
   it("costs nothing while the run stays inside the free allowance", async () => {

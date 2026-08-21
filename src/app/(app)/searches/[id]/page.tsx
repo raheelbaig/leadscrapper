@@ -6,9 +6,11 @@ import { EmptyState } from "@/components/common/empty-state";
 import { PhaseNotice } from "@/components/common/phase-notice";
 import { StatCard } from "@/components/common/stat-card";
 import { PageHeader } from "@/components/layout/page-header";
+import { CoveragePanel } from "@/components/search/coverage-panel";
 import { RunSearchButton } from "@/components/search/run-search-button";
 import { SearchLiveFeed, type SearchEventRow } from "@/components/search/search-live-feed";
 import { SearchStatusBadge } from "@/components/search/search-status-badge";
+import { TileMap } from "@/components/search/tile-map";
 import { TileStateLegend } from "@/components/search/tile-state-legend";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -22,10 +24,12 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { buildCoverageReport, type CoverageTile } from "@/lib/coverage-report";
 import { formatNumber, formatPercent } from "@/lib/format";
 import { TILE_STATE_META, type TileState } from "@/lib/tile-states";
 import { getSupabaseServerClient } from "@/server/db/server-client";
 import { getUsageSummary } from "@/server/quota/usage-report";
+import { PHASE_3B_LIMITS } from "@/server/search/limits";
 
 export const metadata: Metadata = { title: "Search" };
 
@@ -36,17 +40,27 @@ function RunFigure({
   label,
   value,
   hint,
+  tone,
 }: {
   label: string;
   value: React.ReactNode;
   hint?: string;
+  tone?: "warning";
 }) {
   return (
     <div className="space-y-0.5">
       <p className="text-muted-foreground text-[11px] font-medium tracking-wide uppercase">
         {label}
       </p>
-      <p className="text-base font-semibold tabular-nums">{value}</p>
+      <p
+        className={
+          tone === "warning"
+            ? "text-base font-semibold text-amber-600 tabular-nums dark:text-amber-400"
+            : "text-base font-semibold tabular-nums"
+        }
+      >
+        {value}
+      </p>
       {hint ? <p className="text-muted-foreground text-[11px]">{hint}</p> : null}
     </div>
   );
@@ -81,12 +95,28 @@ export default async function SearchDetailPage(props: PageProps<"/searches/[id]"
   }
 
   const s = search;
+  const tileRows = tiles ?? [];
   const leadPct = s.target_leads > 0 ? Math.min((s.leads_found / s.target_leads) * 100, 100) : 0;
   const enterprise = usage.skus.find((sku) => sku.isPrimary) ?? usage.skus[0];
-  const currentTile = (tiles ?? []).find((t) => t.id === s.current_tile_id);
-  const firstTile = (tiles ?? [])[0];
+  const currentTile = tileRows.find((t) => t.id === s.current_tile_id);
+  const nextPending = tileRows.find((t) => t.state === "pending");
 
-  const tileCounts = {
+  // The same function the tick writes to the activity log, so the page and the
+  // ledger cannot tell different stories about what was covered.
+  const coverage = buildCoverageReport({
+    tiles: tileRows.map((tile): CoverageTile => ({
+      label: tile.label,
+      state: tile.state as TileState,
+      area_km2: tile.area_km2 ?? 0,
+      depth: tile.depth,
+    })),
+    target: s.target_leads,
+    leadsFound: s.leads_found,
+  });
+
+  const budgetRemaining = Math.max(PHASE_3B_LIMITS.maxCallsPerSearch - s.api_calls_run, 0);
+
+  const tileCounts: Partial<Record<string, number>> = {
     covered: s.tiles_covered,
     empty: s.tiles_empty,
     saturated_floor: s.tiles_saturated_floor,
@@ -116,19 +146,20 @@ export default async function SearchDetailPage(props: PageProps<"/searches/[id]"
           value={formatPercent(s.coverage_pct, 1)}
           sublabel="Area-weighted, not tile count"
           icon={Percent}
-          tone={s.coverage_pct >= 99.5 ? "positive" : "warning"}
+          tone={coverage.fullyCovered ? "positive" : "warning"}
         />
         <StatCard
           label="Tiles"
-          value={formatNumber(s.tiles_total)}
-          sublabel={`${formatNumber(s.tiles_pending)} still pending`}
+          value={`${formatNumber(coverage.tilesCompleted)} / ${formatNumber(coverage.leafTiles)}`}
+          sublabel={`${formatNumber(coverage.tilesRemaining)} still owed`}
           icon={MapPinned}
         />
         <StatCard
           label="API calls"
-          value={formatNumber(s.api_calls_run)}
-          sublabel="This search"
+          value={`${formatNumber(s.api_calls_run)} / ${formatNumber(PHASE_3B_LIMITS.maxCallsPerSearch)}`}
+          sublabel={`${formatNumber(budgetRemaining)} left in this search's budget`}
           icon={Gauge}
+          tone={budgetRemaining === 0 ? "warning" : undefined}
         />
       </div>
 
@@ -141,21 +172,45 @@ export default async function SearchDetailPage(props: PageProps<"/searches/[id]"
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-5">
-          <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
-            <RunFigure label="Search" value={s.niche} hint={`Query sent: “${s.query_text}”`} />
-            <RunFigure label="Target" value={formatNumber(s.target_leads)} hint="leads" />
+          <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
+            <RunFigure label="Niche" value={s.niche} hint={`Query sent: “${s.query_text}”`} />
+            <RunFigure
+              label="Location"
+              value={s.city}
+              hint={[s.state, s.country].filter(Boolean).join(", ")}
+            />
+            <RunFigure label="Target leads" value={formatNumber(s.target_leads)} />
             <RunFigure
               label="Leads found"
               value={`${formatNumber(s.leads_found)} / ${formatNumber(s.target_leads)}`}
+              hint={coverage.targetReached ? "target reached" : "below target"}
+            />
+            <RunFigure
+              label="Tiles completed"
+              value={`${formatNumber(coverage.tilesCompleted)} / ${formatNumber(coverage.leafTiles)}`}
+              hint={`${formatNumber(coverage.tilesSubdivided)} subdivided`}
+            />
+            <RunFigure
+              label="Tiles remaining"
+              value={formatNumber(coverage.tilesRemaining)}
+              hint={`${coverage.owed.areaKm2.toFixed(1)} km² unsearched`}
+              tone={coverage.tilesRemaining > 0 ? "warning" : undefined}
             />
             <RunFigure
               label="Current tile"
-              value={currentTile?.label ?? firstTile?.label ?? "—"}
-              hint={s.current_page ? `page ${s.current_page}` : "idle"}
+              value={currentTile?.label ?? nextPending?.label ?? "—"}
+              hint={currentTile ? "running" : nextPending ? "next up" : "idle"}
             />
             <RunFigure
-              label="API calls this run"
-              value={formatNumber(s.api_calls_run)}
+              label="Current page"
+              value={
+                s.current_page ? `${s.current_page} / ${PHASE_3B_LIMITS.maxPagesPerTile}` : "—"
+              }
+              hint={s.current_page ? "of this tile" : "idle"}
+            />
+            <RunFigure
+              label="API calls this search"
+              value={`${formatNumber(s.api_calls_run)} / ${formatNumber(PHASE_3B_LIMITS.maxCallsPerSearch)}`}
               hint={s.search_sku.replace("places-text-search-", "")}
             />
             <RunFigure
@@ -179,19 +234,24 @@ export default async function SearchDetailPage(props: PageProps<"/searches/[id]"
             ) : null}
           </div>
 
-          <RunSearchButton searchId={s.id} status={s.status} />
+          <RunSearchButton
+            searchId={s.id}
+            status={s.status}
+            tilesRemaining={coverage.tilesRemaining}
+            budgetRemaining={budgetRemaining}
+          />
         </CardContent>
       </Card>
 
-      <Tabs defaultValue="progress">
+      <Tabs defaultValue="coverage">
         <TabsList>
-          <TabsTrigger value="progress">Progress</TabsTrigger>
+          <TabsTrigger value="coverage">Coverage</TabsTrigger>
           <TabsTrigger value="tiles">Tiles</TabsTrigger>
           <TabsTrigger value="leads">Leads</TabsTrigger>
           <TabsTrigger value="log">Log</TabsTrigger>
         </TabsList>
 
-        <TabsContent value="progress" className="space-y-4 pt-4">
+        <TabsContent value="coverage" className="space-y-4 pt-4">
           <Card>
             <CardHeader>
               <CardTitle>Lead progress</CardTitle>
@@ -206,18 +266,56 @@ export default async function SearchDetailPage(props: PageProps<"/searches/[id]"
 
           <Card>
             <CardHeader>
-              <CardTitle>Grid</CardTitle>
-              <CardDescription>Leaf tiles by state</CardDescription>
+              <CardTitle>Coverage map</CardTitle>
+              <CardDescription>
+                One rectangle per leaf tile, coloured by state. Hover for the reason.
+              </CardDescription>
             </CardHeader>
-            <CardContent>
-              <TileStateLegend counts={tileCounts} />
+            <CardContent className="space-y-4">
+              <TileMap
+                bbox={{
+                  minLat: s.min_lat,
+                  minLng: s.min_lng,
+                  maxLat: s.max_lat,
+                  maxLng: s.max_lng,
+                }}
+                tiles={tileRows}
+                currentTileId={s.current_tile_id}
+              />
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t pt-4">
+                <TileStateLegend counts={tileCounts} />
+                <div className="flex items-center gap-1.5 text-xs">
+                  <span
+                    aria-hidden
+                    className="border-muted-foreground/40 size-2.5 rounded-[3px] border border-dashed"
+                  />
+                  <span className="text-muted-foreground">{TILE_STATE_META.subdivided.label}</span>
+                  <span className="font-medium tabular-nums">{s.tiles_subdivided}</span>
+                </div>
+              </div>
             </CardContent>
           </Card>
 
-          <PhaseNotice phase="Phase 3B — pagination and subdivision">
-            This run fetches a single page of a single tile. A tile that still has a page token is
-            returned to <code className="text-xs">pending</code> rather than being marked covered,
-            so the outstanding work stays visible instead of being written off.
+          <Card>
+            <CardHeader>
+              <CardTitle>What was searched, and what was not</CardTitle>
+              <CardDescription>
+                Area-weighted. A subdivided tile contributes no area of its own — its four children
+                cover it exactly.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <CoveragePanel report={coverage} />
+            </CardContent>
+          </Card>
+
+          <PhaseNotice phase="Phase 3B — controlled grid run">
+            One tile per press, up to three pages each, with a fresh quota reservation for every
+            page. The whole search may spend at most{" "}
+            <code className="text-xs">{PHASE_3B_LIMITS.maxCallsPerSearch}</code> Google calls, and
+            subdivision is capped at depth{" "}
+            <code className="text-xs">{PHASE_3B_LIMITS.maxSubdivisionDepth}</code>. The cron worker
+            is off; nothing runs unless someone presses Run.
           </PhaseNotice>
         </TabsContent>
 
@@ -229,20 +327,25 @@ export default async function SearchDetailPage(props: PageProps<"/searches/[id]"
                   <TableHeader>
                     <TableRow>
                       <TableHead>Tile</TableHead>
+                      <TableHead className="text-right">Depth</TableHead>
                       <TableHead>State</TableHead>
                       <TableHead className="text-right">Results</TableHead>
                       <TableHead className="text-right">New</TableHead>
                       <TableHead className="text-right">Pages</TableHead>
                       <TableHead className="text-right">Calls</TableHead>
+                      <TableHead className="text-right">km²</TableHead>
                       <TableHead>Reason</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {(tiles ?? []).map((tile) => {
+                    {tileRows.map((tile) => {
                       const meta = TILE_STATE_META[tile.state as TileState];
                       return (
                         <TableRow key={tile.id}>
                           <TableCell className="font-medium">{tile.label}</TableCell>
+                          <TableCell className="text-muted-foreground text-right tabular-nums">
+                            {tile.depth}
+                          </TableCell>
                           <TableCell>
                             <Badge variant="outline" className={meta?.badgeClass}>
                               {meta?.label ?? tile.state}
@@ -256,9 +359,13 @@ export default async function SearchDetailPage(props: PageProps<"/searches/[id]"
                           </TableCell>
                           <TableCell className="text-right tabular-nums">
                             {formatNumber(tile.pages_fetched)}
+                            {tile.token_after_last ? "+" : ""}
                           </TableCell>
                           <TableCell className="text-right tabular-nums">
                             {formatNumber(tile.api_calls)}
+                          </TableCell>
+                          <TableCell className="text-muted-foreground text-right tabular-nums">
+                            {(tile.area_km2 ?? 0).toFixed(1)}
                           </TableCell>
                           <TableCell className="text-muted-foreground max-w-md text-xs">
                             {tile.last_reason ?? "—"}
@@ -347,10 +454,7 @@ export default async function SearchDetailPage(props: PageProps<"/searches/[id]"
         <TabsContent value="log" className="pt-4">
           <Card>
             <CardContent className="pt-6">
-              <SearchLiveFeed
-                searchId={s.id}
-                initialEvents={(events ?? []) as SearchEventRow[]}
-              />
+              <SearchLiveFeed searchId={s.id} initialEvents={(events ?? []) as SearchEventRow[]} />
             </CardContent>
           </Card>
         </TabsContent>
