@@ -98,7 +98,13 @@ export async function runControlledTick(
   // -----------------------------------------------------------------------
   // 1. PRE-FLIGHT. Before the lease, before any mutation.
   // -----------------------------------------------------------------------
-  const preflight = await runPreflight({ db });
+  // The pre-flight is told the attempt cap this tick will actually enforce, so
+  // its worst case is this run's worst case rather than the standing ceiling.
+  const maxAttempts = Math.min(
+    options.maxAttempts ?? PHASE_3A_LIMITS.maxAttemptsPerPage,
+    PHASE_3A_LIMITS.maxAttemptsPerPage,
+  );
+  const preflight = await runPreflight({ db, attemptsPerPage: maxAttempts });
 
   if (!preflight.allowed) {
     await logSearchEvent(db, {
@@ -121,7 +127,11 @@ export async function runControlledTick(
   // -----------------------------------------------------------------------
   // 2. Make the search claimable, then claim it.
   // -----------------------------------------------------------------------
-  if (search.status === "draft" || search.status === "paused") {
+  // `failed` is included deliberately. The tile state machine has an explicit
+  // ('failed' -> 'pending', 'retry on resume') transition, so pressing Run on a
+  // failed search means "try again" -- otherwise a single transient API error
+  // would strand the search permanently with no way back.
+  if (search.status === "draft" || search.status === "paused" || search.status === "failed") {
     await db
       .from("searches")
       .update({ status: "queued", queued_at: new Date().toISOString() })
@@ -164,6 +174,27 @@ export async function runControlledTick(
     // by an interrupted run goes back to `pending`, and its page token is
     // dropped because tokens expire -- the tile restarts at page 1.
     await db.rpc("recover_stalled_tiles", { p_search: args.searchId });
+
+    // Retryable leftovers from an earlier run. Both transitions are declared
+    // legal in tile_state_transitions ('retry on resume'), and both represent
+    // work still OWED rather than coverage already achieved -- leaving them
+    // alone would let the run report "nothing to do" over an unsearched tile.
+    const { data: retried } = await db
+      .from("search_tiles")
+      .update({ state: "pending", last_reason: "retry on resume", next_page_token: null })
+      .eq("search_id", args.searchId)
+      .in("state", ["failed", "skipped_quota"])
+      .select("id");
+
+    if (retried && retried.length > 0) {
+      await logSearchEvent(db, {
+        searchId: args.searchId,
+        level: "info",
+        code: "tiles_retried",
+        message: `${retried.length} tile(s) returned to pending for retry.`,
+        meta: { count: retried.length },
+      });
+    }
 
     const { data: tile } = await db
       .from("search_tiles")
@@ -233,7 +264,7 @@ export async function runControlledTick(
         bbox,
         pageIndex: 0,
       },
-      { ...options, db },
+      { ...options, db, maxAttempts },
     );
 
     if (page.kind === "quota-denied") {

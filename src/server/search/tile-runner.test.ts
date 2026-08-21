@@ -210,6 +210,20 @@ describe("recording and refunds", () => {
 });
 
 describe("bounded retries", () => {
+  it("makes NO retry by default, because Phase 3A allows exactly one call", async () => {
+    // The cap lives in PHASE_3A_LIMITS, so every caller inherits it -- the API
+    // route, the Run button and any script alike. The cases below pass
+    // maxAttempts explicitly to exercise mechanics Phase 3B will rely on.
+    const { db, calls } = fakeDb();
+    const { impl } = stubFetch([{ status: 500, body: { error: { message: "boom" } } }]);
+
+    const result = await fetchTilePage(ARGS, { db, fetchImpl: impl, sleep: noSleep });
+
+    expect(result.kind).toBe("error");
+    expect(impl).toHaveBeenCalledTimes(1);
+    expect(calls.filter((c) => c.name === "reserve_api_calls")).toHaveLength(1);
+  });
+
   it("does not retry a 400", async () => {
     const { db, calls } = fakeDb();
     const { impl } = stubFetch([{ status: 400, body: { error: { message: "bad request" } } }]);
@@ -242,7 +256,7 @@ describe("bounded retries", () => {
       { status: 200, body: OK_BODY },
     ]);
 
-    const result = await fetchTilePage(ARGS, { db, fetchImpl: impl, sleep: noSleep });
+    const result = await fetchTilePage(ARGS, { db, fetchImpl: impl, sleep: noSleep, maxAttempts: 3 });
 
     expect(result.kind).toBe("ok");
     expect(impl).toHaveBeenCalledTimes(2);
@@ -259,7 +273,7 @@ describe("bounded retries", () => {
     const { db, calls } = fakeDb();
     const { impl } = stubFetch([{ status: 500, body: { error: { message: "boom" } } }]);
 
-    const result = await fetchTilePage(ARGS, { db, fetchImpl: impl, sleep: noSleep });
+    const result = await fetchTilePage(ARGS, { db, fetchImpl: impl, sleep: noSleep, maxAttempts: 3 });
 
     expect(result.kind).toBe("error");
     expect(impl).toHaveBeenCalledTimes(3);
@@ -272,7 +286,7 @@ describe("bounded retries", () => {
     const { db } = fakeDb({ grants: [true, false] });
     const { impl } = stubFetch([{ status: 500, body: { error: { message: "boom" } } }]);
 
-    const result = await fetchTilePage(ARGS, { db, fetchImpl: impl, sleep: noSleep });
+    const result = await fetchTilePage(ARGS, { db, fetchImpl: impl, sleep: noSleep, maxAttempts: 3 });
 
     expect(result.kind).toBe("quota-denied");
     expect(impl).toHaveBeenCalledTimes(1);
@@ -282,7 +296,7 @@ describe("bounded retries", () => {
     const { db, calls } = fakeDb();
     const { impl } = stubFetch(["network-error"]);
 
-    await fetchTilePage(ARGS, { db, fetchImpl: impl, sleep: noSleep });
+    await fetchTilePage(ARGS, { db, fetchImpl: impl, sleep: noSleep, maxAttempts: 3 });
 
     expect(impl).toHaveBeenCalledTimes(3);
     expect(calls.filter((c) => c.name === "reserve_api_calls").length).toBeLessThanOrEqual(3);
@@ -320,7 +334,10 @@ describe("the request itself", () => {
       return new Response(JSON.stringify({ error: { message: "rate" } }), { status: 429 });
     }) as unknown as typeof fetch;
 
-    await fetchTilePage({ ...ARGS, pageToken: "tok-1" }, { db, fetchImpl: impl, sleep: noSleep });
+    await fetchTilePage(
+      { ...ARGS, pageToken: "tok-1" },
+      { db, fetchImpl: impl, sleep: noSleep, maxAttempts: 3 },
+    );
 
     expect(bodies.length).toBeGreaterThan(1);
     expect(new Set(bodies).size).toBe(1);

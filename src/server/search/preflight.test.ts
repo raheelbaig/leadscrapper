@@ -120,9 +120,11 @@ describe("the budget gate", () => {
 
   it("flags a worst case that does not fit even when the estimate does", async () => {
     // The situation that quietly overspends: an estimate inside the allowance
-    // whose retry ceiling is not.
+    // whose retry ceiling is not. `attemptsPerPage` is passed explicitly
+    // because Phase 3A itself allows no retries, and the flag must still work
+    // for the phase that does.
     state.verified = true;
-    const result = await runPreflight({ db: fakeDb(949) });
+    const result = await runPreflight({ db: fakeDb(949), attemptsPerPage: 3 });
 
     expect(result.allowed).toBe(true);
     expect(result.worstCaseExceedsQuota).toBe(true);
@@ -147,7 +149,24 @@ describe("the estimate", () => {
         PHASE_3A_LIMITS.maxPagesPerTile *
         PHASE_3A_LIMITS.maxAttemptsPerPage,
     );
-    expect(result.estimate.guaranteedMaxCalls).toBeGreaterThan(result.estimate.estimatedCalls);
+    // Phase 3A allows no retries, so the two are equal here. The worst case can
+    // never be LOWER than the estimate, whatever the retry budget.
+    expect(result.estimate.guaranteedMaxCalls).toBeGreaterThanOrEqual(
+      result.estimate.estimatedCalls,
+    );
+  });
+
+  it("grows the worst case with the retry budget, not with the estimate", async () => {
+    // Tests the formula rather than today's constant, so raising the cap in
+    // Phase 3B cannot silently stop the worst case from being reported.
+    const noRetries = await runPreflight({ db: fakeDb(0), attemptsPerPage: 1 });
+    expect(noRetries.estimate.guaranteedMaxCalls).toBe(noRetries.estimate.estimatedCalls);
+
+    const withRetries = await runPreflight({ db: fakeDb(0), attemptsPerPage: 3 });
+    expect(withRetries.estimate.estimatedCalls).toBe(noRetries.estimate.estimatedCalls);
+    expect(withRetries.estimate.guaranteedMaxCalls).toBeGreaterThan(
+      withRetries.estimate.estimatedCalls,
+    );
   });
 
   it("keeps Phase 3A to a single tile and a single page", async () => {

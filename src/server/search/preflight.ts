@@ -112,10 +112,23 @@ export type PreflightOptions = {
   db?: QuotaClient;
   /** Defaults to the Phase 3A single tile. */
   tiles?: number;
+  /**
+   * Attempts the caller will actually allow per page.
+   *
+   * Defaults to the standing Phase 3A ceiling, but a run that caps itself
+   * lower must say so: an estimate is only useful if it describes the run that
+   * is about to happen, not a hypothetical one with a different retry budget.
+   */
+  attemptsPerPage?: number;
 };
 
 export async function runPreflight(options: PreflightOptions = {}): Promise<PreflightResult> {
   const tiles = options.tiles ?? PHASE_3A_LIMITS.maxSeedTiles;
+  // Taken at face value, NOT clamped. This function describes the run it is
+  // told about; enforcing the phase cap is the runner's job, and it passes its
+  // own already-capped number in. Clamping here as well would make the estimate
+  // silently disagree with a caller that legitimately allows more retries.
+  const attemptsPerPage = options.attemptsPerPage ?? PHASE_3A_LIMITS.maxAttemptsPerPage;
 
   // The SKU is DERIVED from the field mask that will actually be sent, never
   // named. Phone and website are Enterprise fields and both are required, so
@@ -125,8 +138,7 @@ export async function runPreflight(options: PreflightOptions = {}): Promise<Pref
   const config = pricing.getSkuConfig(sku);
 
   const estimatedCalls = tiles * PHASE_3A_LIMITS.maxPagesPerTile;
-  const guaranteedMaxCalls =
-    tiles * PHASE_3A_LIMITS.maxPagesPerTile * PHASE_3A_LIMITS.maxAttemptsPerPage;
+  const guaranteedMaxCalls = tiles * PHASE_3A_LIMITS.maxPagesPerTile * attemptsPerPage;
 
   const snapshot = await getQuotaSnapshot(sku, { db: options.db });
 

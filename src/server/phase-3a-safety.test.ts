@@ -251,13 +251,18 @@ describe("the Phase 3A limits are at their safe values", () => {
     expect(PHASE_3A_LIMITS.maxTargetLeads).toBeLessThanOrEqual(20);
   });
 
-  it("bounds the retries, so one page can never become many calls", () => {
-    expect(PHASE_3A_LIMITS.maxAttemptsPerPage).toBeLessThanOrEqual(3);
+  it("allows no retries, so a tick can spend at most one call", () => {
+    // Pinned exactly, not as an inequality. "Exactly one Google request" is the
+    // specification for this phase, and it is enforced here rather than at the
+    // call site so that no code path -- route, button or script -- can widen it
+    // by forgetting to pass an option.
+    expect(PHASE_3A_LIMITS.maxAttemptsPerPage).toBe(1);
+    expect(PHASE_3A_LIMITS.maxCallsPerTick).toBe(1);
     expect(
       PHASE_3A_LIMITS.maxSeedTiles *
         PHASE_3A_LIMITS.maxPagesPerTile *
         PHASE_3A_LIMITS.maxAttemptsPerPage,
-    ).toBeLessThanOrEqual(PHASE_3A_LIMITS.maxCallsPerTick);
+    ).toBe(1);
   });
 });
 

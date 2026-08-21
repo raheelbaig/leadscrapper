@@ -32,9 +32,20 @@ export const PHASE_3A_LIMITS = {
   /** A controlled proof needs a handful of leads, not a lead list. */
   maxTargetLeads: 20,
   /** Total billable calls a single controlled tick may make, retries included. */
-  maxCallsPerTick: 3,
-  /** Attempts for one page: the first try plus two retries on transient errors. */
-  maxAttemptsPerPage: 3,
+  maxCallsPerTick: 1,
+  /**
+   * Attempts for one page. ONE -- no retries.
+   *
+   * A retry is a second billable request, and this phase is specified as
+   * "exactly one Google request". Capping it here rather than at the call site
+   * makes that structural: the API route, the Run button and any script all
+   * inherit it, so no code path can spend a second call by forgetting to pass
+   * an option. A transient 429 or 5xx is therefore reported rather than
+   * retried, which is the correct trade for a smoke test.
+   *
+   * Phase 3B raises this deliberately, alongside pagination.
+   */
+  maxAttemptsPerPage: 1,
 } as const;
 
 export class Phase3aLimitError extends Error {
