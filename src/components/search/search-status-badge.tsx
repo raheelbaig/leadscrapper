@@ -1,14 +1,22 @@
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 
+/**
+ * Plain-English statuses.
+ *
+ * `queued` reads as "Starting" and `running` as "Searching" because those are
+ * what the user is waiting for; `failed` reads as "Needs attention" because a
+ * failed section returns to pending and retries, so the run is recoverable
+ * rather than lost. The underlying enum is unchanged -- this is presentation.
+ */
 const STATUS_META: Record<string, { label: string; className: string }> = {
   draft: { label: "Draft", className: "bg-muted text-muted-foreground border-border" },
   queued: {
-    label: "Queued",
+    label: "Starting",
     className: "border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-400",
   },
   running: {
-    label: "Running",
+    label: "Searching",
     className: "border-blue-500/30 bg-blue-500/10 text-blue-700 dark:text-blue-400",
   },
   paused: {
@@ -16,11 +24,11 @@ const STATUS_META: Record<string, { label: string; className: string }> = {
     className: "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400",
   },
   completed: {
-    label: "Completed",
+    label: "Complete",
     className: "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400",
   },
   failed: {
-    label: "Failed",
+    label: "Needs attention",
     className: "border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-400",
   },
   canceled: {

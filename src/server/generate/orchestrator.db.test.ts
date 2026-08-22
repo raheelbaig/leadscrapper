@@ -1,0 +1,693 @@
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { buildCoverageReport, type CoverageTile } from "@/lib/coverage-report";
+import type { TileState } from "@/lib/tile-states";
+import type { EnrichmentRunResult } from "@/server/enrichment/run-enrichment";
+import type { ControlledTickResult } from "@/server/search/run-controlled-tick";
+
+import { GENERATION_LIMITS } from "./limits";
+
+/**
+ * The guided flow against the REAL database. OPT-IN:
+ *
+ *     LEAD_SCRAPPER_DB_TESTS=1 npx vitest run src/server/generate/orchestrator.db.test.ts
+ *
+ * ---------------------------------------------------------------------------
+ * ZERO GOOGLE CALLS. ZERO EXTERNAL REQUESTS.
+ *
+ * `runControlledTick` and `runEnrichment` are INJECTED. The fakes move tiles
+ * through the real state machine, insert real lead rows and advance
+ * `searches.api_calls_run` exactly as a real tick would -- but they reach
+ * nothing. In particular the tick fake never calls `record_api_call`, so
+ * `api_usage_counters` is not touched and the month's real allowance is
+ * unaffected; the suite asserts that at the end.
+ *
+ * What is real: the schema, the tile state machine, the coverage computation,
+ * the quota snapshot, the phase machine, and every one of the orchestrator's
+ * own budget decisions. Those are the things a mock could only prove agreed
+ * with itself.
+ *
+ * Every fixture is created by the suite and deleted afterwards. The real
+ * historical searches and leads are never selected, never modified, and are
+ * asserted untouched at the end.
+ * ---------------------------------------------------------------------------
+ */
+
+const ENABLED = process.env.LEAD_SCRAPPER_DB_TESTS === "1";
+
+type Db = ReturnType<typeof import("@/server/db/admin").getSupabaseAdminClient>;
+
+/** A tiny rectangle: at an 8 km seed edge it floors to the 4-tile minimum. */
+const SMALL_BOX = { minLat: 29.7, minLng: -95.4, maxLat: 29.72, maxLng: -95.38 };
+/** Big enough to tile into far more areas than one approval can pay for. */
+const LARGE_BOX = { minLat: 29.5, minLng: -95.6, maxLat: 29.8, maxLng: -95.3 };
+
+describe.skipIf(!ENABLED)("guided generation orchestration", () => {
+  let db: Db;
+  let userId: string;
+  let orchestrator: typeof import("./orchestrator");
+  let stateModule: typeof import("./state");
+
+  const createdSearchIds: string[] = [];
+
+  let searchesBefore: unknown;
+  let leadsBefore: unknown;
+  let countersBefore: unknown;
+
+  beforeAll(async () => {
+    const { getSupabaseAdminClient } = await import("@/server/db/admin");
+    db = getSupabaseAdminClient();
+    orchestrator = await import("./orchestrator");
+    stateModule = await import("./state");
+
+    const { data: anySearch } = await db.from("searches").select("user_id").limit(1).single();
+    userId = anySearch!.user_id;
+
+    const { data: searches } = await db
+      .from("searches")
+      .select("id, status, leads_found, api_calls_run, coverage_pct, stop_reason")
+      .order("id");
+    searchesBefore = searches;
+
+    const { data: leads } = await db.from("leads").select("id, email_status").order("id");
+    leadsBefore = leads;
+
+    const { data: counters } = await db.from("api_usage_counters").select("*").order("sku");
+    countersBefore = counters;
+  });
+
+  afterAll(async () => {
+    // Order matters: leads and tiles hang off the search, and generation runs
+    // cascade with it.
+    for (const searchId of createdSearchIds) {
+      await db.from("leads").delete().eq("search_id", searchId);
+      await db.from("generation_runs").delete().eq("search_id", searchId);
+      await db.from("searches").delete().eq("id", searchId);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Fakes
+  // -------------------------------------------------------------------------
+
+  /**
+   * Stands in for one real tick.
+   *
+   * Honours `maxTilesPerTick` -- which is the whole point, since that is the
+   * only lever the orchestrator uses to keep a slice inside the approval.
+   * Records what it was asked for so the tests can assert on it.
+   */
+  function makeTickFake(options: { callsPerArea?: number; asked: number[] }) {
+    const callsPerArea = options.callsPerArea ?? 1;
+
+    return async function fakeTick(
+      args: { searchId: string; userId: string },
+      tickOptions: { maxTilesPerTick?: number } = {},
+    ): Promise<ControlledTickResult> {
+      const maxTiles = tickOptions.maxTilesPerTick ?? 12;
+      options.asked.push(maxTiles);
+
+      const { data: pending } = await db
+        .from("search_tiles")
+        .select("id, label")
+        .eq("search_id", args.searchId)
+        .eq("state", "pending")
+        .order("path")
+        .limit(maxTiles);
+
+      let apiCalls = 0;
+      let leadsInserted = 0;
+
+      for (const tile of pending ?? []) {
+        const startedAt = new Date().toISOString();
+        // Through the real, trigger-enforced state machine.
+        await db
+          .from("search_tiles")
+          .update({ state: "in_progress", started_at: startedAt })
+          .eq("id", tile.id);
+        await db
+          .from("search_tiles")
+          .update({
+            state: "covered",
+            completed_at: new Date(Date.parse(startedAt) + 3_000).toISOString(),
+            api_calls: callsPerArea,
+            pages_fetched: 1,
+            results_count: 2,
+            unique_new_count: 2,
+            last_reason: "fake tick (no Google request was made)",
+          })
+          .eq("id", tile.id);
+
+        apiCalls += callsPerArea;
+
+        // Two leads per area, both with a website so the email phase has work.
+        const rows = [0, 1].map((n) => ({
+          user_id: args.userId,
+          search_id: args.searchId,
+          tile_id: tile.id,
+          place_id: `fake-place-${tile.id}-${n}`,
+          name: `Fake Business ${tile.label} #${n}`,
+          website: `https://example.invalid/${tile.id}-${n}`,
+          query_tile: tile.label,
+          raw: {},
+        }));
+        const { error } = await db.from("leads").insert(rows);
+        if (!error) leadsInserted += rows.length;
+      }
+
+      // Billed against the SEARCH only. `api_usage_counters` is deliberately
+      // untouched: no Google request was made, so nothing may be recorded
+      // against the month's real allowance.
+      const { data: current } = await db
+        .from("searches")
+        .select("api_calls_run, leads_found, target_leads, status")
+        .eq("id", args.searchId)
+        .single();
+
+      await db
+        .from("searches")
+        .update({ api_calls_run: (current?.api_calls_run ?? 0) + apiCalls })
+        .eq("id", args.searchId);
+
+      await db.rpc("recompute_search_progress", { p_search: args.searchId });
+
+      const { data: tiles } = await db
+        .from("search_tiles")
+        .select("label, state, area_km2, depth")
+        .eq("search_id", args.searchId)
+        .order("path");
+
+      const { data: after } = await db
+        .from("searches")
+        .select("api_calls_run, leads_found, target_leads, status, tiles_pending")
+        .eq("id", args.searchId)
+        .single();
+
+      const coverage = buildCoverageReport({
+        tiles: (tiles ?? []).map((tile): CoverageTile => ({
+          label: tile.label,
+          state: tile.state as TileState,
+          area_km2: tile.area_km2 ?? 0,
+          depth: tile.depth,
+        })),
+        target: after?.target_leads ?? 0,
+        leadsFound: after?.leads_found ?? 0,
+      });
+
+      const stopReason =
+        coverage.tilesRemaining === 0 ? "coverage_complete" : "tile_budget_reached";
+
+      return {
+        outcome: stopReason === "coverage_complete" ? "completed" : "paused-tile-limit",
+        searchId: args.searchId,
+        searchStatus: after?.status ?? "running",
+        stopReason,
+        tiles: [],
+        apiCalls,
+        apiCallsTotal: after?.api_calls_run ?? 0,
+        callBudget: 150,
+        resultsReceived: leadsInserted,
+        leadsInserted,
+        duplicatesRejected: 0,
+        placesRejected: 0,
+        leadsFound: after?.leads_found ?? 0,
+        targetLeads: after?.target_leads ?? 0,
+        targetReached: (after?.leads_found ?? 0) >= (after?.target_leads ?? 0),
+        preflight: null as never,
+        coverage,
+        error: null,
+      };
+    } as unknown as typeof import("@/server/search/run-controlled-tick").runControlledTick;
+  }
+
+  /** Stands in for one real enrichment batch. Reaches nothing. */
+  function makeEnrichmentFake(counters: { calls: number }) {
+    return async function fakeEnrichment(args: {
+      userId: string;
+      searchId?: string;
+      limit?: number;
+    }): Promise<EnrichmentRunResult> {
+      counters.calls += 1;
+
+      const limit = args.limit ?? GENERATION_LIMITS.enrichmentLeadsPerAdvance;
+
+      const { data: candidates } = await db
+        .from("leads")
+        .select("id")
+        .eq("search_id", args.searchId!)
+        .eq("user_id", args.userId)
+        .eq("email_status", "not_enriched")
+        .not("website", "is", null)
+        .neq("website", "")
+        .order("created_at")
+        .limit(limit);
+
+      let found = 0;
+      for (const [index, lead] of (candidates ?? []).entries()) {
+        // Alternating outcomes, so the results page has a realistic mixture.
+        const isFound = index % 2 === 0;
+        if (isFound) found += 1;
+
+        await db
+          .from("leads")
+          .update({
+            email_status: isFound ? "found" : "not_found",
+            email: isFound ? `hello+${lead.id}@example.invalid` : null,
+            email_confidence: isFound ? 0.8 : null,
+            email_source: "website",
+            email_checked_at: new Date().toISOString(),
+          })
+          .eq("id", lead.id);
+
+        await db.from("lead_enrichment_attempts").insert({
+          user_id: args.userId,
+          lead_id: lead.id,
+          provider: "fake",
+          status: isFound ? "found" : "not_found",
+          email: isFound ? `hello+${lead.id}@example.invalid` : null,
+          duration_ms: 4_000,
+          cost_units: 0,
+          raw: {},
+        });
+      }
+
+      const { count: remaining } = await db
+        .from("leads")
+        .select("id", { count: "exact", head: true })
+        .eq("search_id", args.searchId!)
+        .eq("email_status", "not_enriched")
+        .not("website", "is", null)
+        .neq("website", "");
+
+      const processed = candidates?.length ?? 0;
+
+      return {
+        dryRun: false,
+        mode: "new",
+        selected: processed,
+        processed,
+        found,
+        notFound: processed - found,
+        failed: 0,
+        remaining: remaining ?? 0,
+        scope: null as never,
+        results: [],
+      };
+    } as unknown as typeof import("@/server/enrichment/run-enrichment").runEnrichment;
+  }
+
+  async function createRun(args: {
+    enrichEmails: boolean;
+    testBbox?: typeof SMALL_BOX;
+    targetLeads?: number;
+  }) {
+    const created = await orchestrator.createGenerationRun(
+      {
+        niche: `Guided Fixture ${Date.now()}`,
+        country: "Testland",
+        state: null,
+        city: "Fixtureville",
+        targetLeads: args.targetLeads ?? 40,
+        gridConfig: (await import("@/lib/constants")).DEFAULT_GRID_CONFIG,
+        testBbox: args.testBbox ?? SMALL_BOX,
+        enrichEmails: args.enrichEmails,
+      } as never,
+      { userId },
+    );
+
+    createdSearchIds.push(created.searchId);
+    return created;
+  }
+
+  // -------------------------------------------------------------------------
+  // Creating an approval
+  // -------------------------------------------------------------------------
+
+  it("records the approval and the consent, and spends nothing doing it", async () => {
+    const created = await createRun({ enrichEmails: true });
+
+    const { data: run } = await db
+      .from("generation_runs")
+      .select("*")
+      .eq("id", created.runId)
+      .single();
+
+    expect(run!.status).toBe("running");
+    expect(run!.phase).toBe("searching");
+    expect(run!.call_ceiling).toBe(GENERATION_LIMITS.maxGoogleCallsPerRun);
+    expect(run!.api_calls_at_start).toBe(0);
+    // A TIMESTAMP, not a boolean: the row says when consent was given.
+    expect(run!.enrichment_consented_at).not.toBeNull();
+
+    // Planning is free. Nothing has been requested from Google.
+    const { data: search } = await db
+      .from("searches")
+      .select("api_calls_run, status")
+      .eq("id", created.searchId)
+      .single();
+    expect(search!.api_calls_run).toBe(0);
+    expect(search!.status).toBe("draft");
+  });
+
+  it("records the absence of consent just as explicitly", async () => {
+    const created = await createRun({ enrichEmails: false });
+
+    const { data: run } = await db
+      .from("generation_runs")
+      .select("enrichment_consented_at")
+      .eq("id", created.runId)
+      .single();
+
+    expect(run!.enrichment_consented_at).toBeNull();
+  });
+
+  it("refuses a second live approval for the same search", async () => {
+    const created = await createRun({ enrichEmails: true });
+
+    await expect(
+      orchestrator.continueGenerationRun({
+        searchId: created.searchId,
+        userId,
+        enrichEmails: true,
+      }),
+    ).rejects.toThrow(/already has a generation in progress/i);
+  });
+
+  // -------------------------------------------------------------------------
+  // Advancing
+  // -------------------------------------------------------------------------
+
+  it("asks for only as many areas as the approval can pay for at their worst case", async () => {
+    const created = await createRun({ enrichEmails: true });
+    const asked: number[] = [];
+
+    await orchestrator.advanceGenerationRun(
+      { runId: created.runId, userId },
+      { runTick: makeTickFake({ asked }), runEnrichment: makeEnrichmentFake({ calls: 0 }) },
+    );
+
+    // floor(30 / 9) = 3. Never the tick runner's own cap of 12.
+    expect(asked[0]).toBe(3);
+  });
+
+  it("walks searching -> finding emails -> ready and completes", async () => {
+    const created = await createRun({ enrichEmails: true });
+    const asked: number[] = [];
+    const enrichmentCounter = { calls: 0 };
+
+    const deps = {
+      runTick: makeTickFake({ asked }),
+      runEnrichment: makeEnrichmentFake(enrichmentCounter),
+    };
+
+    const phases: string[] = [];
+    let state = await stateModule.loadGenerationState({ runId: created.runId, userId });
+
+    for (let i = 0; i < 30 && state.status === "running" && state.canAdvance; i += 1) {
+      state = await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
+      phases.push(state.phase);
+    }
+
+    expect(phases).toContain("searching");
+    expect(phases).toContain("enriching");
+    expect(state.phase).toBe("ready");
+    expect(state.status).toBe("completed");
+    expect(state.stopReason).toBe("generation_complete");
+
+    // Coverage is the completion criterion, and it was actually met.
+    expect(state.search.fullyCovered).toBe(true);
+    expect(state.search.areasRemaining).toBe(0);
+
+    // Email discovery really ran, and found something.
+    expect(enrichmentCounter.calls).toBeGreaterThan(0);
+    expect(state.enrichment.remaining).toBe(0);
+    expect(state.enrichment.found).toBeGreaterThan(0);
+
+    // Phase boundaries were persisted, which is what makes elapsed survive.
+    const { data: run } = await db
+      .from("generation_runs")
+      .select("search_started_at, search_completed_at, enrichment_started_at, completed_at")
+      .eq("id", created.runId)
+      .single();
+
+    expect(run!.search_started_at).not.toBeNull();
+    expect(run!.search_completed_at).not.toBeNull();
+    expect(run!.enrichment_started_at).not.toBeNull();
+    expect(run!.completed_at).not.toBeNull();
+  });
+
+  /**
+   * THE CEILING.
+   *
+   * Every area costs its worst case here, so the approval binds long before the
+   * geography is covered. The run must stop having spent AT MOST what the user
+   * approved -- not approximately, and never one call more.
+   */
+  it("never exceeds the approved call ceiling, even when every area costs its worst case", async () => {
+    const created = await createRun({ enrichEmails: true, testBbox: LARGE_BOX });
+    const asked: number[] = [];
+
+    const deps = {
+      runTick: makeTickFake({ asked, callsPerArea: GENERATION_LIMITS.worstCaseCallsPerArea }),
+      runEnrichment: makeEnrichmentFake({ calls: 0 }),
+    };
+
+    let state = await stateModule.loadGenerationState({ runId: created.runId, userId });
+
+    for (let i = 0; i < 20 && state.status === "running" && state.canAdvance; i += 1) {
+      state = await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
+      // Checked after EVERY advance, not only at the end.
+      expect(state.budget.used).toBeLessThanOrEqual(GENERATION_LIMITS.maxGoogleCallsPerRun);
+    }
+
+    expect(state.status).toBe("stopped");
+    expect(state.stopReason).toBe("generation_call_ceiling");
+    expect(state.budget.used).toBeLessThanOrEqual(GENERATION_LIMITS.maxGoogleCallsPerRun);
+
+    // It stopped with area still owed, and says so rather than claiming to be
+    // finished.
+    expect(state.search.fullyCovered).toBe(false);
+    expect(state.search.areasRemaining).toBeGreaterThan(0);
+
+    // A further advance is refused: the approval is spent.
+    const usedAtStop = state.budget.used;
+    const after = await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
+    expect(after.budget.used).toBe(usedAtStop);
+    expect(after.status).toBe("stopped");
+  });
+
+  it("counts a continuation's ceiling from a fresh watermark", async () => {
+    const created = await createRun({ enrichEmails: false, testBbox: LARGE_BOX });
+    const deps = {
+      runTick: makeTickFake({ asked: [], callsPerArea: GENERATION_LIMITS.worstCaseCallsPerArea }),
+      runEnrichment: makeEnrichmentFake({ calls: 0 }),
+    };
+
+    let state = await stateModule.loadGenerationState({ runId: created.runId, userId });
+    for (let i = 0; i < 20 && state.status === "running" && state.canAdvance; i += 1) {
+      state = await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
+    }
+
+    const spentByFirst = state.budget.searchCallsUsed;
+    expect(spentByFirst).toBeGreaterThan(0);
+
+    const next = await orchestrator.continueGenerationRun({
+      searchId: created.searchId,
+      userId,
+      enrichEmails: false,
+    });
+
+    const fresh = await stateModule.loadGenerationState({ runId: next.runId, userId });
+
+    // The previous approval's spending belongs to it, not to this one.
+    expect(fresh.budget.used).toBe(0);
+    expect(fresh.budget.remaining).toBe(GENERATION_LIMITS.maxGoogleCallsPerRun);
+    expect(fresh.budget.searchCallsUsed).toBe(spentByFirst);
+  });
+
+  // -------------------------------------------------------------------------
+  // Consent
+  // -------------------------------------------------------------------------
+
+  /**
+   * THE CONSENT GATE.
+   *
+   * Without a recorded consent the orchestrator must not call the enrichment
+   * service AT ALL -- not with a narrowed scope, not in dry-run. The counter
+   * proves it was never reached.
+   */
+  it("never starts email discovery that was not consented to", async () => {
+    const created = await createRun({ enrichEmails: false });
+    const enrichmentCounter = { calls: 0 };
+
+    const deps = {
+      runTick: makeTickFake({ asked: [] }),
+      runEnrichment: makeEnrichmentFake(enrichmentCounter),
+    };
+
+    let state = await stateModule.loadGenerationState({ runId: created.runId, userId });
+    for (let i = 0; i < 20 && state.status === "running" && state.canAdvance; i += 1) {
+      state = await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
+    }
+
+    expect(enrichmentCounter.calls).toBe(0);
+    expect(state.stopReason).toBe("enrichment_not_consented");
+    expect(state.phase).toBe("ready");
+    expect(state.enrichment.consented).toBe(false);
+    // The leads are still there and still offer the option.
+    expect(state.enrichment.remaining).toBeGreaterThan(0);
+
+    const { data: attempts } = await db
+      .from("lead_enrichment_attempts")
+      .select("id")
+      .in(
+        "lead_id",
+        (await db.from("leads").select("id").eq("search_id", created.searchId)).data!.map(
+          (lead) => lead.id,
+        ),
+      );
+    expect(attempts ?? []).toHaveLength(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // Stopping, resuming, reconstructing
+  // -------------------------------------------------------------------------
+
+  it("stops on request and keeps everything already collected", async () => {
+    const created = await createRun({ enrichEmails: true, testBbox: LARGE_BOX });
+    const deps = {
+      runTick: makeTickFake({ asked: [] }),
+      runEnrichment: makeEnrichmentFake({ calls: 0 }),
+    };
+
+    await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
+    const beforeStop = await stateModule.loadGenerationState({ runId: created.runId, userId });
+    expect(beforeStop.search.leadsFound).toBeGreaterThan(0);
+
+    const stopped = await orchestrator.stopGenerationRun({ runId: created.runId, userId });
+    expect(stopped.status).toBe("stopped");
+    expect(stopped.stopReason).toBe("stopped_by_user");
+    expect(stopped.canAdvance).toBe(false);
+
+    // Nothing was rolled back.
+    expect(stopped.search.leadsFound).toBe(beforeStop.search.leadsFound);
+
+    // And a further advance does nothing at all.
+    const asked: number[] = [];
+    const after = await orchestrator.advanceGenerationRun(
+      { runId: created.runId, userId },
+      { runTick: makeTickFake({ asked }), runEnrichment: makeEnrichmentFake({ calls: 0 }) },
+    );
+    expect(asked).toHaveLength(0);
+    expect(after.search.leadsFound).toBe(beforeStop.search.leadsFound);
+  });
+
+  it("rebuilds the same state on a reopen, with elapsed time from persisted timestamps", async () => {
+    const created = await createRun({ enrichEmails: true, testBbox: LARGE_BOX });
+    const deps = {
+      runTick: makeTickFake({ asked: [] }),
+      runEnrichment: makeEnrichmentFake({ calls: 0 }),
+    };
+
+    await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
+
+    const { data: run } = await db
+      .from("generation_runs")
+      .select("created_at, search_started_at")
+      .eq("id", created.runId)
+      .single();
+
+    // "Reopening" is simply reading again -- there is no client state to
+    // restore, because there is none to lose.
+    const fixedNow = Date.parse(run!.created_at) + 252_000;
+    const reopened = await stateModule.loadGenerationState(
+      { runId: created.runId, userId },
+      { now: () => fixedNow },
+    );
+
+    expect(reopened.totalElapsedSeconds).toBe(252);
+    expect(reopened.search.startedAt).toBe(run!.search_started_at);
+
+    // Reading it a second time at the same instant gives the same answer: the
+    // figures come from the database, not from anything accumulating.
+    const again = await stateModule.loadGenerationState(
+      { runId: created.runId, userId },
+      { now: () => fixedNow },
+    );
+    expect(again.totalElapsedSeconds).toBe(reopened.totalElapsedSeconds);
+    expect(again.search.leadsFound).toBe(reopened.search.leadsFound);
+    expect(again.budget.used).toBe(reopened.budget.used);
+  });
+
+  it("never returns a negative elapsed time when the clock disagrees", async () => {
+    const created = await createRun({ enrichEmails: true });
+
+    const { data: run } = await db
+      .from("generation_runs")
+      .select("created_at")
+      .eq("id", created.runId)
+      .single();
+
+    const state = await stateModule.loadGenerationState(
+      { runId: created.runId, userId },
+      { now: () => Date.parse(run!.created_at) - 10_000 },
+    );
+
+    expect(state.totalElapsedSeconds).toBe(0);
+  });
+
+  /**
+   * THE DEFINING PRODUCT RULE, end to end.
+   *
+   * Target 2, dozens of leads, area still owed: the run keeps going and reports
+   * the target as a metric that was exceeded, never as a completion.
+   */
+  it("keeps searching when the lead target is exceeded but area is still owed", async () => {
+    const created = await createRun({
+      enrichEmails: false,
+      testBbox: LARGE_BOX,
+      targetLeads: 2,
+    });
+    const deps = {
+      runTick: makeTickFake({ asked: [] }),
+      runEnrichment: makeEnrichmentFake({ calls: 0 }),
+    };
+
+    const state = await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
+
+    expect(state.search.leadsFound).toBeGreaterThan(state.search.targetLeads);
+    expect(state.search.targetReached).toBe(true);
+    expect(state.search.fullyCovered).toBe(false);
+    expect(state.search.areasRemaining).toBeGreaterThan(0);
+
+    // Still running, and still willing to advance.
+    expect(state.status).toBe("running");
+    expect(state.canAdvance).toBe(true);
+    expect(state.stopReason).toBeNull();
+  });
+
+  // -------------------------------------------------------------------------
+  // Nothing real was touched
+  // -------------------------------------------------------------------------
+
+  it("leaves the month's Google allowance exactly as it found it", async () => {
+    const { data: counters } = await db.from("api_usage_counters").select("*").order("sku");
+    expect(counters).toEqual(countersBefore);
+  });
+
+  it("leaves every pre-existing search and lead untouched", async () => {
+    const { data: searches } = await db
+      .from("searches")
+      .select("id, status, leads_found, api_calls_run, coverage_pct, stop_reason")
+      .not("id", "in", `(${createdSearchIds.join(",")})`)
+      .order("id");
+    expect(searches).toEqual(searchesBefore);
+
+    const { data: leads } = await db
+      .from("leads")
+      .select("id, email_status")
+      .not("search_id", "in", `(${createdSearchIds.join(",")})`)
+      .order("id");
+    expect(leads).toEqual(leadsBefore);
+  });
+});

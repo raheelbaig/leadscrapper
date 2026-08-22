@@ -1,4 +1,4 @@
-import { Gauge, MapPinned, Plus, Search, Users } from "lucide-react";
+import { Gauge, Mail, MapPinned, Search, Sparkles, Users } from "lucide-react";
 import type { Metadata } from "next";
 import Link from "next/link";
 
@@ -29,12 +29,34 @@ export default async function DashboardPage() {
         title="Dashboard"
         description="Coverage-first lead generation for your embroidery digitizing business."
         actions={
-          <Link href="/find-leads" className={cn(buttonVariants({ size: "lg" }), "gap-2")}>
-            <Plus className="size-4" />
-            Find New Leads
+          <Link href="/generate" className={cn(buttonVariants({ size: "lg" }), "gap-2")}>
+            <Sparkles className="size-4" />
+            Generate New Leads
           </Link>
         }
       />
+
+      {summary.activeGeneration ? (
+        <Card className="border-primary/40 bg-primary/[0.03]">
+          <CardContent className="flex flex-wrap items-center justify-between gap-3 pt-6">
+            <div className="min-w-0">
+              <p className="text-sm font-medium">Generation in progress</p>
+              <p className="text-muted-foreground truncate text-xs">
+                {summary.activeGeneration.niche} · {summary.activeGeneration.label} ·{" "}
+                {summary.activeGeneration.phase === "searching"
+                  ? "searching businesses"
+                  : "finding business emails"}
+              </p>
+            </div>
+            <Link
+              href={`/generate/${summary.activeGeneration.id}`}
+              className={cn(buttonVariants({ size: "sm" }), "gap-2")}
+            >
+              View progress
+            </Link>
+          </CardContent>
+        </Card>
+      ) : null}
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
@@ -44,10 +66,11 @@ export default async function DashboardPage() {
           icon={Users}
         />
         <StatCard
-          label="Leads this month"
-          value={formatNumber(summary.leadsThisMonth)}
-          sublabel="Since the 1st"
-          icon={MapPinned}
+          label="Emails found"
+          value={formatNumber(summary.emailsFound)}
+          sublabel={`${formatNumber(summary.leadsThisMonth)} new leads since the 1st`}
+          icon={Mail}
+          tone={summary.emailsFound > 0 ? "positive" : undefined}
         />
         <StatCard
           label="Searches"
@@ -69,7 +92,9 @@ export default async function DashboardPage() {
           <CardHeader>
             <CardTitle>Active searches</CardTitle>
             <CardDescription>
-              Searches keep running on the server. Closing this tab does not stop them.
+              Every area searched, every lead and every figure is stored on the server. Closing this
+              tab pauses a generation where it is — nothing is lost, and reopening it continues from
+              the same point.
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -77,9 +102,9 @@ export default async function DashboardPage() {
               <EmptyState
                 icon={Search}
                 title="Nothing running"
-                description="Start a search and it will keep working in the background until the area is covered or the free quota runs out."
-                actionLabel="Find New Leads"
-                actionHref="/find-leads"
+                description="Generate leads and this is where the run in progress appears, with the area it has covered so far."
+                actionLabel="Generate New Leads"
+                actionHref="/generate"
               />
             ) : (
               <ul className="divide-border divide-y">
@@ -187,9 +212,9 @@ export default async function DashboardPage() {
             <EmptyState
               icon={MapPinned}
               title="No searches yet"
-              description="Pick a niche and a city, and the grid will be built from the city's real bounding box — not from your lead target."
-              actionLabel="Find New Leads"
-              actionHref="/find-leads"
+              description="Pick a niche and an area, and the whole area is divided into sections and searched — the size of the grid follows the area, never your lead target."
+              actionLabel="Generate New Leads"
+              actionHref="/generate"
             />
           ) : (
             <ul className="divide-border divide-y text-sm">

@@ -274,6 +274,74 @@ export type Database = {
           },
         ]
       }
+      generation_runs: {
+        Row: {
+          api_calls_at_start: number
+          call_ceiling: number
+          completed_at: string | null
+          created_at: string
+          enrichment_completed_at: string | null
+          enrichment_consented_at: string | null
+          enrichment_started_at: string | null
+          id: string
+          last_error: string | null
+          phase: Database["public"]["Enums"]["generation_phase"]
+          search_completed_at: string | null
+          search_id: string
+          search_started_at: string | null
+          status: Database["public"]["Enums"]["generation_status"]
+          stop_reason: string | null
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          api_calls_at_start?: number
+          call_ceiling?: number
+          completed_at?: string | null
+          created_at?: string
+          enrichment_completed_at?: string | null
+          enrichment_consented_at?: string | null
+          enrichment_started_at?: string | null
+          id?: string
+          last_error?: string | null
+          phase?: Database["public"]["Enums"]["generation_phase"]
+          search_completed_at?: string | null
+          search_id: string
+          search_started_at?: string | null
+          status?: Database["public"]["Enums"]["generation_status"]
+          stop_reason?: string | null
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          api_calls_at_start?: number
+          call_ceiling?: number
+          completed_at?: string | null
+          created_at?: string
+          enrichment_completed_at?: string | null
+          enrichment_consented_at?: string | null
+          enrichment_started_at?: string | null
+          id?: string
+          last_error?: string | null
+          phase?: Database["public"]["Enums"]["generation_phase"]
+          search_completed_at?: string | null
+          search_id?: string
+          search_started_at?: string | null
+          status?: Database["public"]["Enums"]["generation_status"]
+          stop_reason?: string | null
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "generation_runs_search_id_fkey"
+            columns: ["search_id"]
+            isOneToOne: false
+            referencedRelation: "searches"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       lead_enrichment_attempts: {
         Row: {
           confidence: number | null
@@ -1184,6 +1252,8 @@ export type Database = {
         | "failed"
       event_level: "info" | "warn" | "error"
       export_status: "pending" | "ready" | "failed"
+      generation_phase: "searching" | "enriching" | "ready"
+      generation_status: "running" | "stopped" | "completed" | "failed"
       search_status:
         | "draft"
         | "queued"
@@ -1343,6 +1413,8 @@ export const Constants = {
       ],
       event_level: ["info", "warn", "error"],
       export_status: ["pending", "ready", "failed"],
+      generation_phase: ["searching", "enriching", "ready"],
+      generation_status: ["running", "stopped", "completed", "failed"],
       search_status: [
         "draft",
         "queued",

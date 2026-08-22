@@ -6,6 +6,7 @@ import {
   MapPinned,
   Search,
   Settings,
+  Sparkles,
   Users,
 } from "lucide-react";
 
@@ -22,6 +23,15 @@ export type NavSection = {
   items: NavItem[];
 };
 
+/**
+ * Navigation, ordered by how often a normal day needs it.
+ *
+ * The normal path is Generate Leads -> the processing screen -> the results
+ * page, and none of the steps in between are navigation the user has to
+ * perform. Everything under "Advanced" still works and is still linked to from
+ * the results page; those pages became history and detail views rather than
+ * stops on the way to a lead list.
+ */
 export const NAV_SECTIONS: NavSection[] = [
   {
     label: "Overview",
@@ -32,38 +42,39 @@ export const NAV_SECTIONS: NavSection[] = [
         icon: LayoutDashboard,
         hint: "Everything at a glance",
       },
+      {
+        href: "/generate",
+        label: "Generate Leads",
+        icon: Sparkles,
+        hint: "Niche, area, and one button",
+      },
+      { href: "/leads", label: "Leads", icon: Users, hint: "Every business you have found" },
     ],
   },
   {
-    label: "Find",
+    label: "Advanced",
     items: [
-      {
-        href: "/find-leads",
-        label: "Find Leads",
-        icon: MapPinned,
-        hint: "Start a new coverage-first search",
-      },
       {
         href: "/searches",
-        label: "Searches",
+        label: "Search History",
         icon: Search,
-        hint: "Running, paused and finished searches",
+        hint: "Coverage maps, sections and activity logs",
       },
-    ],
-  },
-  {
-    label: "Manage",
-    items: [
-      { href: "/leads", label: "Leads", icon: Users, hint: "Every business you have found" },
+      { href: "/exports", label: "Exports", icon: Download, hint: "Every workbook you generated" },
       { href: "/enrichment", label: "Enrichment", icon: Mail, hint: "Email discovery status" },
-      { href: "/exports", label: "Exports", icon: Download, hint: "Generated workbooks" },
-    ],
-  },
-  {
-    label: "System",
-    items: [
       { href: "/usage", label: "API Usage", icon: Gauge, hint: "Free quota and spend protection" },
-      { href: "/settings", label: "Settings", icon: Settings, hint: "Grid defaults and areas" },
+      {
+        href: "/settings",
+        label: "Settings",
+        icon: Settings,
+        hint: "Grid defaults and saved areas",
+      },
+      {
+        href: "/find-leads",
+        label: "Manual Search",
+        icon: MapPinned,
+        hint: "Build a search by hand, run it tick by tick",
+      },
     ],
   },
 ];

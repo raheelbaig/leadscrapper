@@ -320,15 +320,56 @@ describe("no email enrichment happens", () => {
   it("never auto-triggers enrichment from a schedule, a tick or a search", () => {
     // A cron job, a worker tick or a search completion calling this would make
     // enrichment automatic, which is the one thing it must never be.
+    //
+    // AMENDED 2026-08-23 for the guided flow. `src/server/generate/orchestrator`
+    // does call `runEnrichment` -- that is the whole point of a one-button
+    // journey, and it was approved deliberately. What was actually being
+    // protected is not "no caller" but "no caller the user did not ask for",
+    // so the exemption is granted to exactly one file and paid for by the
+    // consent assertions in the test below. Note what is still absent from this
+    // list: the worker, the tick runner, any cron path, and the search loop.
+    const ORCHESTRATOR = "src/server/generate/orchestrator.ts";
+
     const callers = ALL_FILES.filter((file) => {
       const relative = rel(file);
       if (isTest(file)) return false;
       if (relative === "src/app/api/enrichment/run/route.ts") return false;
+      if (relative === ORCHESTRATOR) return false;
       if (relative.startsWith("src/server/enrichment/")) return false;
       return /runEnrichment\s*\(/.test(readCode(file));
     }).map(rel);
 
     expect(callers).toEqual([]);
+  });
+
+  it("lets the guided flow reach enrichment ONLY behind a recorded consent", () => {
+    const orchestrator = readCode(
+      path.resolve(process.cwd(), "src/server/generate/orchestrator.ts"),
+    );
+
+    // The gate is a column on the run row, checked in the orchestrator itself
+    // -- not a boolean from the request, and not a condition in the UI. A
+    // generation with no recorded consent ends without the enrichment service
+    // being called at all.
+    expect(orchestrator).toMatch(/if \(!run\.enrichment_consented_at\)/);
+    expect(orchestrator).toMatch(/enrichment_not_consented/);
+
+    // The consent check must come BEFORE the call, in the same function.
+    const phase = orchestrator.slice(orchestrator.indexOf("async function advanceEnrichmentPhase"));
+    const gateAt = phase.indexOf("!run.enrichment_consented_at");
+    const callAt = phase.indexOf("await runEnrichment(");
+    expect(gateAt).toBeGreaterThan(-1);
+    expect(callAt).toBeGreaterThan(gateAt);
+  });
+
+  it("keeps the worker and every cron path away from enrichment", () => {
+    // The durable worker is off, but if it were switched on it must still never
+    // reach a business's website. It runs `runControlledTick` and nothing else.
+    const worker = readCode(path.resolve(process.cwd(), "src/server/worker/worker-tick.ts"));
+    expect(worker).not.toMatch(/enrichment/i);
+
+    const cron = readCode(path.resolve(process.cwd(), "supabase/migrations/0009_cron_worker.sql"));
+    expect(cron).not.toMatch(/enrich/i);
   });
 
   it("never claims an address was verified", () => {
