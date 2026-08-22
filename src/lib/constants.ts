@@ -67,7 +67,25 @@ export const DEFAULT_GRID_CONFIG = {
   saturationRatio: 0.95,
   minSeedTiles: 4,
   maxSeedTiles: 400,
-  stopOnTargetReached: true,
+  /**
+   * FALSE, and this is the defining behaviour of the product.
+   *
+   * The lead target is a MINIMUM DESIRED BENCHMARK, not a termination
+   * condition. A search that wanted 40 leads, found 87, and still has tiles
+   * pending has not finished -- it has exceeded its benchmark with geography
+   * still owed, and it keeps going. The only terminal success is
+   * `coverage_complete`: every leaf tile accounted for.
+   *
+   * Coverage and the lead target are separate concepts and are never conflated
+   * in the runner, the UI, or the export. "Target exceeded" is a metric to
+   * display; it is never a reason to stop.
+   *
+   * Kept as a per-search field rather than deleted so that searches created
+   * before 2026-08-22 keep the frozen policy they were created under, and so
+   * that switching one of them over is an explicit, recorded act. See
+   * `amendStopPolicy`.
+   */
+  stopOnTargetReached: false,
 };
 
 export type GridConfig = typeof DEFAULT_GRID_CONFIG;
@@ -85,10 +103,18 @@ export const INITIAL_AVG_PAGES_PER_TILE = 1.2;
 
 // --- Presentation ----------------------------------------------------------
 export const APP_NAME = "Lead Scrapper";
-export const APP_DESCRIPTION =
-  "Coverage-first local lead generation for embroidery digitizing.";
+export const APP_DESCRIPTION = "Coverage-first local lead generation for embroidery digitizing.";
 
-/** Fixed export column order. Identical before and after enrichment. */
+/**
+ * Fixed export column order. Identical before and after enrichment, so a sheet
+ * exported today lines up column-for-column with one exported next month.
+ *
+ * `Enriched At` is the timestamp on `leads.email_checked_at` -- the moment the
+ * enrichment subsystem last looked, whatever it concluded. It is deliberately
+ * not called "Email Found At": a lead that was checked and had no address is a
+ * different fact from one that was never checked, and the export has to keep
+ * them apart.
+ */
 export const EXPORT_COLUMNS = [
   "Business Name",
   "Phone",
@@ -104,4 +130,7 @@ export const EXPORT_COLUMNS = [
   "Email Status",
   "Email Source",
   "Email Confidence",
+  "Enriched At",
 ] as const;
+
+export type ExportColumn = (typeof EXPORT_COLUMNS)[number];

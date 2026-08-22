@@ -3,11 +3,15 @@ import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 
 import { EmptyState } from "@/components/common/empty-state";
-import { PhaseNotice } from "@/components/common/phase-notice";
 import { StatCard } from "@/components/common/stat-card";
+import { ExportSearchButton } from "@/components/export/export-button";
 import { PageHeader } from "@/components/layout/page-header";
 import { CoveragePanel } from "@/components/search/coverage-panel";
 import { RunSearchButton } from "@/components/search/run-search-button";
+import {
+  ContinueToFullCoverageButton,
+  SearchActionsMenu,
+} from "@/components/search/search-actions";
 import { SearchLiveFeed, type SearchEventRow } from "@/components/search/search-live-feed";
 import { SearchStatusBadge } from "@/components/search/search-status-badge";
 import { TileMap } from "@/components/search/tile-map";
@@ -29,7 +33,7 @@ import { formatNumber, formatPercent } from "@/lib/format";
 import { TILE_STATE_META, type TileState } from "@/lib/tile-states";
 import { getSupabaseServerClient } from "@/server/db/server-client";
 import { getUsageSummary } from "@/server/quota/usage-report";
-import { PHASE_3B_LIMITS } from "@/server/search/limits";
+import { SEARCH_LIMITS } from "@/server/search/limits";
 
 export const metadata: Metadata = { title: "Search" };
 
@@ -114,7 +118,16 @@ export default async function SearchDetailPage(props: PageProps<"/searches/[id]"
     leadsFound: s.leads_found,
   });
 
-  const budgetRemaining = Math.max(PHASE_3B_LIMITS.maxCallsPerSearch - s.api_calls_run, 0);
+  const budgetRemaining = Math.max(SEARCH_LIMITS.maxCallsPerSearch - s.api_calls_run, 0);
+
+  // Searches created before 2026-08-22 froze the old policy into grid_config,
+  // where the lead target ended the run. Their frozen definition is honoured
+  // rather than rewritten, so the page has to say so and offer the amendment.
+  const gridConfig =
+    s.grid_config && typeof s.grid_config === "object" && !Array.isArray(s.grid_config)
+      ? (s.grid_config as Record<string, unknown>)
+      : {};
+  const stopsAtTarget = gridConfig.stopOnTargetReached === true;
 
   const tileCounts: Partial<Record<string, number>> = {
     covered: s.tiles_covered,
@@ -131,14 +144,29 @@ export default async function SearchDetailPage(props: PageProps<"/searches/[id]"
       <PageHeader
         title={s.niche}
         description={s.label}
-        actions={<SearchStatusBadge status={s.status} />}
+        actions={
+          <div className="flex items-center gap-2">
+            <SearchStatusBadge status={s.status} />
+            <ExportSearchButton searchId={s.id} leadCount={s.leads_found} size="sm" />
+            <SearchActionsMenu
+              searchId={s.id}
+              status={s.status}
+              leadCount={s.leads_found}
+              redirectTo="/searches"
+            />
+          </div>
+        }
       />
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
           label="Leads"
           value={`${formatNumber(s.leads_found)} / ${formatNumber(s.target_leads)}`}
-          sublabel={`${Math.round(leadPct)}% of target`}
+          sublabel={
+            coverage.targetReached
+              ? `minimum target met (${Math.round(leadPct)}%)`
+              : `${Math.round(leadPct)}% of the minimum target`
+          }
           icon={Users}
         />
         <StatCard
@@ -156,7 +184,7 @@ export default async function SearchDetailPage(props: PageProps<"/searches/[id]"
         />
         <StatCard
           label="API calls"
-          value={`${formatNumber(s.api_calls_run)} / ${formatNumber(PHASE_3B_LIMITS.maxCallsPerSearch)}`}
+          value={`${formatNumber(s.api_calls_run)} / ${formatNumber(SEARCH_LIMITS.maxCallsPerSearch)}`}
           sublabel={`${formatNumber(budgetRemaining)} left in this search's budget`}
           icon={Gauge}
           tone={budgetRemaining === 0 ? "warning" : undefined}
@@ -179,11 +207,15 @@ export default async function SearchDetailPage(props: PageProps<"/searches/[id]"
               value={s.city}
               hint={[s.state, s.country].filter(Boolean).join(", ")}
             />
-            <RunFigure label="Target leads" value={formatNumber(s.target_leads)} />
+            <RunFigure
+              label="Target leads"
+              value={formatNumber(s.target_leads)}
+              hint="a minimum, not a stopping point"
+            />
             <RunFigure
               label="Leads found"
               value={`${formatNumber(s.leads_found)} / ${formatNumber(s.target_leads)}`}
-              hint={coverage.targetReached ? "target reached" : "below target"}
+              hint={coverage.targetReached ? "minimum met" : "below the minimum"}
             />
             <RunFigure
               label="Tiles completed"
@@ -203,14 +235,12 @@ export default async function SearchDetailPage(props: PageProps<"/searches/[id]"
             />
             <RunFigure
               label="Current page"
-              value={
-                s.current_page ? `${s.current_page} / ${PHASE_3B_LIMITS.maxPagesPerTile}` : "—"
-              }
+              value={s.current_page ? `${s.current_page} / ${SEARCH_LIMITS.maxPagesPerTile}` : "—"}
               hint={s.current_page ? "of this tile" : "idle"}
             />
             <RunFigure
               label="API calls this search"
-              value={`${formatNumber(s.api_calls_run)} / ${formatNumber(PHASE_3B_LIMITS.maxCallsPerSearch)}`}
+              value={`${formatNumber(s.api_calls_run)} / ${formatNumber(SEARCH_LIMITS.maxCallsPerSearch)}`}
               hint={s.search_sku.replace("places-text-search-", "")}
             />
             <RunFigure
@@ -234,6 +264,28 @@ export default async function SearchDetailPage(props: PageProps<"/searches/[id]"
             ) : null}
           </div>
 
+          {stopsAtTarget ? (
+            <div className="space-y-3 rounded-lg border border-amber-500/40 bg-amber-500/5 p-4">
+              <div className="space-y-1">
+                <p className="text-sm font-medium text-amber-700 dark:text-amber-400">
+                  This search still uses the old stop policy
+                </p>
+                <p className="text-muted-foreground text-xs">
+                  It was created when reaching the lead target ended a run, so it stops at{" "}
+                  {formatNumber(s.target_leads)} leads with {formatNumber(coverage.tilesRemaining)}{" "}
+                  tile(s) — {coverage.owed.areaKm2.toFixed(1)} km² — never searched. Its frozen
+                  configuration is left exactly as it was recorded. Continuing changes only the stop
+                  policy: the geometry and every lead already collected stay untouched, and the
+                  change is written to the activity log.
+                </p>
+              </div>
+              <ContinueToFullCoverageButton
+                searchId={s.id}
+                tilesRemaining={coverage.tilesRemaining}
+              />
+            </div>
+          ) : null}
+
           <RunSearchButton
             searchId={s.id}
             status={s.status}
@@ -256,7 +308,9 @@ export default async function SearchDetailPage(props: PageProps<"/searches/[id]"
             <CardHeader>
               <CardTitle>Lead progress</CardTitle>
               <CardDescription>
-                {formatNumber(s.leads_found)} of {formatNumber(s.target_leads)} target leads
+                {formatNumber(s.leads_found)} against a minimum target of{" "}
+                {formatNumber(s.target_leads)}. The target is a benchmark — the search finishes when
+                the area is covered, not when this bar fills.
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -309,14 +363,31 @@ export default async function SearchDetailPage(props: PageProps<"/searches/[id]"
             </CardContent>
           </Card>
 
-          <PhaseNotice phase="Phase 3B — controlled grid run">
-            One tile per press, up to three pages each, with a fresh quota reservation for every
-            page. The whole search may spend at most{" "}
-            <code className="text-xs">{PHASE_3B_LIMITS.maxCallsPerSearch}</code> Google calls, and
-            subdivision is capped at depth{" "}
-            <code className="text-xs">{PHASE_3B_LIMITS.maxSubdivisionDepth}</code>. The cron worker
-            is off; nothing runs unless someone presses Run.
-          </PhaseNotice>
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-sm">How this search ends</CardTitle>
+              <CardDescription>
+                Completion is geographic. The lead target is a minimum you asked for, and exceeding
+                it is a result rather than a reason to stop.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="text-muted-foreground space-y-2 text-sm">
+              <p>
+                A search is marked <span className="text-foreground font-medium">completed</span>{" "}
+                only when every leaf tile is accounted for. Every other ending — the call budget,
+                the free allowance, the time slice, a failed tile, a pause — leaves it{" "}
+                <span className="text-foreground font-medium">paused</span> with the remaining
+                geography still owed and still visible above.
+              </p>
+              <p>
+                Each press works through pending tiles until a budget stops it: up to three pages
+                per tile with a fresh quota reservation for every page, and at most{" "}
+                <code className="text-xs">{SEARCH_LIMITS.maxCallsPerSearch}</code> Google calls for
+                the whole search, cumulative across resumes. Subdivision is capped at depth{" "}
+                <code className="text-xs">{SEARCH_LIMITS.maxSubdivisionDepth}</code>.
+              </p>
+            </CardContent>
+          </Card>
         </TabsContent>
 
         <TabsContent value="tiles" className="pt-4">

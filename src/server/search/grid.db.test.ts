@@ -4,6 +4,7 @@ import { buildCoverageReport, type CoverageTile } from "@/lib/coverage-report";
 import { bboxAreaKm2 } from "@/lib/geo/bbox";
 import type { TileState } from "@/lib/tile-states";
 import type { LeadPayload } from "@/server/places/lead-mapper";
+import { SEARCH_LIMITS } from "@/server/search/limits";
 
 /**
  * The Phase 3B grid engine, against the REAL database. OPT-IN:
@@ -84,7 +85,10 @@ describe.skipIf(!ENABLED)("the Phase 3B grid engine", () => {
           saturationRatio: 0.95,
           minSeedTiles: 4,
           maxSeedTiles: 400,
-          stopOnTargetReached: true,
+          // False, which is now the only value the product ships. The probe
+          // used to pass `true` here; carrying that forward would have made
+          // this suite assert the behaviour Phase 4 removed.
+          stopOnTargetReached: false,
         },
         testBbox: TEST_BBOX,
       },
@@ -109,14 +113,23 @@ describe.skipIf(!ENABLED)("the Phase 3B grid engine", () => {
       expect(tileIds).toHaveLength(6);
     });
 
-    it("caps the grid config to the phase limits at creation time", async () => {
+    it("freezes the grid config the runner will actually honour", async () => {
       const { data } = await db.from("searches").select("grid_config").eq("id", searchId).single();
 
       const config = data?.grid_config as Record<string, unknown>;
-      // Requested 3, and the row must record what will ACTUALLY happen.
-      expect(config.maxSubdivisionDepth).toBe(1);
-      expect(config.maxSeedTiles).toBe(9);
-      expect(config.phase).toBe("3B-controlled");
+
+      // The row records what will ACTUALLY happen, clamped to the server
+      // limits -- not the raw request. These are the Phase 4 values; the
+      // controlled Phase 3B caps (depth 1, 9 seed tiles) were raised by
+      // approval on 2026-08-22.
+      expect(config.maxSubdivisionDepth).toBe(SEARCH_LIMITS.maxSubdivisionDepth);
+      expect(config.maxSeedTiles).toBe(SEARCH_LIMITS.maxSeedTiles);
+      expect(config.maxCallsPerSearch).toBe(SEARCH_LIMITS.maxCallsPerSearch);
+      expect(config.phase).toBe("4");
+
+      // The stop policy is frozen too, and it is the new default: the lead
+      // target does not end this search.
+      expect(config.stopOnTargetReached).toBe(false);
     });
 
     it("starts every tile pending, at depth 0", async () => {

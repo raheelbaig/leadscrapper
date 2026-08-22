@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 import { createSearchSchema } from "@/lib/schemas/search";
 import { getCurrentUser } from "@/server/db/server-client";
 import { createSearch } from "@/server/search/create-search";
-import { PHASE_3B_LIMITS, SearchLimitError } from "@/server/search/limits";
+import { SEARCH_LIMITS, SearchLimitError } from "@/server/search/limits";
 import { runPreflight } from "@/server/search/preflight";
 
 /**
@@ -54,7 +54,7 @@ export async function POST(request: Request) {
     // press can spend, and the guaranteed maximum is the per-search budget
     // regardless.
     const preflight = await runPreflight({
-      tiles: Math.min(created.grid.tileCount, PHASE_3B_LIMITS.maxTilesPerTick),
+      tiles: Math.min(created.grid.tileCount, SEARCH_LIMITS.maxTilesPerTick),
     });
 
     return NextResponse.json(

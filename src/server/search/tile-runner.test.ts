@@ -4,7 +4,7 @@ import { PAGE_TOKEN_DELAY_MS } from "@/lib/constants";
 import type { BoundingBox } from "@/lib/geo/bbox";
 import { QuotaBlockedError, type QuotaClient } from "@/server/quota/quota-service";
 
-import { PHASE_3B_LIMITS } from "./limits";
+import { SEARCH_LIMITS } from "./limits";
 import { fetchTilePage, paginateTile, type TilePageEvent } from "./tile-runner";
 
 /**
@@ -213,7 +213,7 @@ describe("recording and refunds", () => {
 
 describe("bounded retries", () => {
   it("retries a transient failure up to the phase cap by default", async () => {
-    // The cap lives in PHASE_3B_LIMITS, so every caller inherits it -- the API
+    // The cap lives in SEARCH_LIMITS, so every caller inherits it -- the API
     // route, the Run button and any script alike. Phase 3A pinned this at one
     // attempt; Phase 3B raised it deliberately, alongside pagination.
     const { db, calls } = fakeDb();
@@ -222,10 +222,10 @@ describe("bounded retries", () => {
     const result = await fetchTilePage(ARGS, { db, fetchImpl: impl, sleep: noSleep });
 
     expect(result.kind).toBe("error");
-    expect(impl).toHaveBeenCalledTimes(PHASE_3B_LIMITS.maxAttemptsPerPage);
+    expect(impl).toHaveBeenCalledTimes(SEARCH_LIMITS.maxAttemptsPerPage);
     // Every attempt is a separate billable request, so every attempt reserved.
     expect(calls.filter((c) => c.name === "reserve_api_calls")).toHaveLength(
-      PHASE_3B_LIMITS.maxAttemptsPerPage,
+      SEARCH_LIMITS.maxAttemptsPerPage,
     );
   });
 
@@ -235,7 +235,7 @@ describe("bounded retries", () => {
 
     await fetchTilePage(ARGS, { db, fetchImpl: impl, sleep: noSleep, maxAttempts: 99 });
 
-    expect(impl).toHaveBeenCalledTimes(PHASE_3B_LIMITS.maxAttemptsPerPage);
+    expect(impl).toHaveBeenCalledTimes(SEARCH_LIMITS.maxAttemptsPerPage);
   });
 
   it("does not retry a 400", async () => {

@@ -84,8 +84,12 @@ export default async function DashboardPage() {
             ) : (
               <ul className="divide-border divide-y">
                 {summary.activeSearches.map((s) => {
-                  const pct =
-                    s.target_leads > 0 ? Math.min((s.leads_found / s.target_leads) * 100, 100) : 0;
+                  // The bar tracks COVERAGE, not leads. A progress bar is read
+                  // as "how done is this", and what finishes a search is the
+                  // geography — filling a lead bar to 100% would say the run
+                  // was over when it may have searched a third of the area.
+                  const pct = Math.min(Math.max(s.coverage_pct, 0), 100);
+                  const targetMet = s.target_leads > 0 && s.leads_found >= s.target_leads;
 
                   return (
                     <li key={s.id} className="py-3 first:pt-0 last:pb-0">
@@ -106,6 +110,7 @@ export default async function DashboardPage() {
                           <div className="flex justify-between text-xs tabular-nums">
                             <span className="text-muted-foreground">
                               {formatNumber(s.leads_found)} / {formatNumber(s.target_leads)} leads
+                              {targetMet ? " ✓" : ""}
                             </span>
                             <span>{formatPercent(s.coverage_pct, 0)} area</span>
                           </div>

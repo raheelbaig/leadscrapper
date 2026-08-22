@@ -5,7 +5,7 @@ import type { PricingStatus } from "@/lib/types/usage";
 import * as pricing from "@/server/pricing/pricing-service";
 import { getQuotaSnapshot, type QuotaClient } from "@/server/quota/quota-service";
 
-import { PHASE_3B_LIMITS, maxTilesAfterSubdivision } from "./limits";
+import { SEARCH_LIMITS, maxTilesAfterSubdivision } from "./limits";
 
 /**
  * The pre-flight check every run must pass before a single Google request is
@@ -152,10 +152,10 @@ export type PreflightOptions = {
 
 export async function runPreflight(options: PreflightOptions = {}): Promise<PreflightResult> {
   const tiles = options.tiles ?? 1;
-  const pagesPerTile = options.pagesPerTile ?? PHASE_3B_LIMITS.maxPagesPerTile;
-  const attemptsPerPage = options.attemptsPerPage ?? PHASE_3B_LIMITS.maxAttemptsPerPage;
-  const maxSubdivisionDepth = options.maxSubdivisionDepth ?? PHASE_3B_LIMITS.maxSubdivisionDepth;
-  const callBudget = options.callBudget ?? PHASE_3B_LIMITS.maxCallsPerSearch;
+  const pagesPerTile = options.pagesPerTile ?? SEARCH_LIMITS.maxPagesPerTile;
+  const attemptsPerPage = options.attemptsPerPage ?? SEARCH_LIMITS.maxAttemptsPerPage;
+  const maxSubdivisionDepth = options.maxSubdivisionDepth ?? SEARCH_LIMITS.maxSubdivisionDepth;
+  const callBudget = options.callBudget ?? SEARCH_LIMITS.maxCallsPerSearch;
   const callsAlreadySpent = Math.max(options.callsAlreadySpent ?? 0, 0);
   const callBudgetRemaining = Math.max(callBudget - callsAlreadySpent, 0);
 
@@ -235,8 +235,10 @@ export async function runPreflight(options: PreflightOptions = {}): Promise<Pref
         title: "CONTROLLED RUN BUDGET SPENT",
         message: `This search has made ${callsAlreadySpent} of its ${callBudget} permitted Google calls.`,
         action:
-          "The controlled Phase 3B budget is deliberately small. Review what the run collected, " +
-          "then raise maxCallsPerSearch in src/server/search/limits.ts if more is genuinely warranted.",
+          "This is the per-search spending ceiling, and since the lead target no longer stops a " +
+          "run it is the only thing that does. Review what the run collected and what area is " +
+          "still owed, then raise maxCallsPerSearch in src/server/search/limits.ts only if the " +
+          "remaining geography is genuinely worth the calls.",
       },
       estimate,
       quota,

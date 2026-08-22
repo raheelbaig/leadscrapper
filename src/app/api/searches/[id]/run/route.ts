@@ -15,12 +15,14 @@ import { runControlledTick } from "@/server/search/run-controlled-tick";
  * per tick, calls per tick, calls per SEARCH, and wall-clock -- and whichever
  * binds first stops the run with the remaining geography still owed.
  *
- * NO OPTIONS ARE ACCEPTED. Every limit is read from PHASE_3B_LIMITS on the
+ * NO OPTIONS ARE ACCEPTED. Every limit is read from SEARCH_LIMITS on the
  * server, so nothing the browser sends can widen what a press may spend.
  *
- * This is the manual trigger for Phase 3B. The cron-driven worker stays off --
- * `private.worker_config.enabled` is still false, and nothing here changes it.
- * A search runs because a person pressed a button.
+ * This is the MANUAL trigger. The cron-driven worker at POST /api/jobs runs the
+ * same `runControlledTick` with a shorter slice, but it stays off:
+ * `private.worker_config.enabled` is false, and nothing in this application can
+ * change it -- `private` is not exposed through PostgREST. Today a search runs
+ * because a person pressed a button.
  *
  * A blocked pre-flight returns 409 with the banner text, having made no Google
  * request, taken no lease, and mutated no tile.

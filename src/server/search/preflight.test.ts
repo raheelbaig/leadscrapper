@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { INITIAL_AVG_PAGES_PER_TILE } from "@/lib/constants";
 import type { QuotaClient } from "@/server/quota/quota-service";
 
-import { PHASE_3B_LIMITS, maxTilesAfterSubdivision } from "./limits";
+import { SEARCH_LIMITS, maxTilesAfterSubdivision } from "./limits";
 import { PRICING_BLOCK, SearchBlockedError, runPreflight } from "./preflight";
 
 const state = vi.hoisted(() => ({ verified: false }));
@@ -105,8 +105,8 @@ describe("the per-search call budget", () => {
     state.verified = true;
     const result = await runPreflight({ db: fakeDb(0), tiles: 6 });
 
-    expect(result.estimate.geometricMaxCalls).toBeGreaterThan(PHASE_3B_LIMITS.maxCallsPerSearch);
-    expect(result.estimate.guaranteedMaxCalls).toBe(PHASE_3B_LIMITS.maxCallsPerSearch);
+    expect(result.estimate.geometricMaxCalls).toBeGreaterThan(SEARCH_LIMITS.maxCallsPerSearch);
+    expect(result.estimate.guaranteedMaxCalls).toBe(SEARCH_LIMITS.maxCallsPerSearch);
     expect(result.estimate.budgetBinds).toBe(true);
   });
 
@@ -115,9 +115,9 @@ describe("the per-search call budget", () => {
     const result = await runPreflight({ db: fakeDb(0), tiles: 6 });
 
     expect(result.estimate.geometricMaxCalls).toBe(
-      maxTilesAfterSubdivision(6, PHASE_3B_LIMITS.maxSubdivisionDepth) *
-        PHASE_3B_LIMITS.maxPagesPerTile *
-        PHASE_3B_LIMITS.maxAttemptsPerPage,
+      maxTilesAfterSubdivision(6, SEARCH_LIMITS.maxSubdivisionDepth) *
+        SEARCH_LIMITS.maxPagesPerTile *
+        SEARCH_LIMITS.maxAttemptsPerPage,
     );
   });
 
@@ -126,16 +126,16 @@ describe("the per-search call budget", () => {
     const fresh = await runPreflight({ db: fakeDb(0), tiles: 6, callsAlreadySpent: 0 });
     const resumed = await runPreflight({ db: fakeDb(0), tiles: 6, callsAlreadySpent: 30 });
 
-    expect(fresh.estimate.callBudgetRemaining).toBe(PHASE_3B_LIMITS.maxCallsPerSearch);
-    expect(resumed.estimate.callBudgetRemaining).toBe(PHASE_3B_LIMITS.maxCallsPerSearch - 30);
-    expect(resumed.estimate.guaranteedMaxCalls).toBe(PHASE_3B_LIMITS.maxCallsPerSearch - 30);
+    expect(fresh.estimate.callBudgetRemaining).toBe(SEARCH_LIMITS.maxCallsPerSearch);
+    expect(resumed.estimate.callBudgetRemaining).toBe(SEARCH_LIMITS.maxCallsPerSearch - 30);
+    expect(resumed.estimate.guaranteedMaxCalls).toBe(SEARCH_LIMITS.maxCallsPerSearch - 30);
   });
 
   it("blocks the run outright once the budget is spent", async () => {
     state.verified = true;
     const result = await runPreflight({
       db: fakeDb(0),
-      callsAlreadySpent: PHASE_3B_LIMITS.maxCallsPerSearch,
+      callsAlreadySpent: SEARCH_LIMITS.maxCallsPerSearch,
     });
 
     expect(result.allowed).toBe(false);
@@ -150,7 +150,7 @@ describe("the per-search call budget", () => {
     state.verified = true;
     const result = await runPreflight({
       db: fakeDb(0),
-      callsAlreadySpent: PHASE_3B_LIMITS.maxCallsPerSearch,
+      callsAlreadySpent: SEARCH_LIMITS.maxCallsPerSearch,
     });
 
     expect(result.quota.remaining).toBeGreaterThan(100);
@@ -251,7 +251,7 @@ describe("the estimate", () => {
 
     expect(flat.estimate.geometricMaxCalls).toBe(6 * 3 * 3);
     expect(deep.estimate.geometricMaxCalls).toBe(6 * (1 + 4 + 16 + 64) * 3 * 3);
-    expect(deep.estimate.guaranteedMaxCalls).toBe(PHASE_3B_LIMITS.maxCallsPerSearch);
+    expect(deep.estimate.guaranteedMaxCalls).toBe(SEARCH_LIMITS.maxCallsPerSearch);
   });
 
   it("describes the run it is told about, without clamping it", async () => {

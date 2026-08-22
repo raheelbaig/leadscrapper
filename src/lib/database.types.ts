@@ -983,6 +983,67 @@ export type Database = {
           isSetofReturn: true
         }
       }
+      claim_search_job_by_id: {
+        Args: { p_lease_seconds?: number; p_search: string; p_worker: string }
+        Returns: {
+          api_calls_run: number
+          area_covered_km2: number
+          area_total_km2: number
+          city: string
+          country: string
+          coverage_pct: number
+          coverage_report: Json | null
+          created_at: string
+          current_page: number | null
+          current_tile_id: string | null
+          custom_area_id: string | null
+          field_mask: string[]
+          finished_at: string | null
+          grid_config: Json
+          grid_key: string
+          heartbeat_at: string | null
+          id: string
+          label: string
+          last_error: string | null
+          leads_found: number
+          location_id: string | null
+          locked_at: string | null
+          locked_by: string | null
+          max_lat: number
+          max_lng: number
+          min_lat: number
+          min_lng: number
+          niche: string
+          pricing_version: string
+          query_text: string
+          queued_at: string | null
+          search_sku: string
+          started_at: string | null
+          state: string | null
+          status: Database["public"]["Enums"]["search_status"]
+          status_text: string | null
+          stop_reason: string | null
+          target_leads: number
+          tick_count: number
+          tiles_covered: number
+          tiles_empty: number
+          tiles_failed: number
+          tiles_in_progress: number
+          tiles_pending: number
+          tiles_saturated_floor: number
+          tiles_skipped_quota: number
+          tiles_subdivided: number
+          tiles_total: number
+          updated_at: string
+          user_id: string
+        }[]
+        SetofOptions: {
+          from: "*"
+          to: "searches"
+          isOneToOne: false
+          isSetofReturn: true
+        }
+      }
       create_child_tiles: {
         Args: { p_reason?: string; p_tile: string }
         Returns: number

@@ -20,7 +20,7 @@ import { ManualBboxProvider } from "@/server/geo/providers/manual-provider";
 import type { ResolvedLocation } from "@/server/geo/types";
 import * as pricing from "@/server/pricing/pricing-service";
 
-import { PHASE_3B_LIMITS, SearchLimitError } from "./limits";
+import { SEARCH_LIMITS, SearchLimitError } from "./limits";
 import { logSearchEvent } from "./events";
 
 /**
@@ -33,8 +33,9 @@ import { logSearchEvent } from "./events";
  *
  * The grid is COVERAGE-FIRST. `target_leads` has zero influence on the
  * geometry: the tile count follows from the size of the rectangle and the seed
- * edge length alone. A target decides only when a run may stop early, and the
- * coverage report then has to say exactly what geography went unsearched.
+ * edge length alone. Nor does it influence when a run ends -- it is a minimum
+ * desired benchmark, and the search finishes when the geography is accounted
+ * for. The coverage report always says exactly what went unsearched.
  *
  * Writes go through the service-role client because `search_tiles` deliberately
  * has no authenticated INSERT policy -- tile geometry is the input to every
@@ -85,28 +86,36 @@ export async function createSearch(
   // ---------------------------------------------------------------------
   // 1. The rectangle.
   //
-  // A controlled test supplies its own. It is resolved through the SAME chain
-  // the real flow uses, but with only the manual provider in it: the chain
-  // tries the cache and the fixtures FIRST, so leaving them in would let a
-  // request for a small test box resolve to the whole city instead.
+  // An explicit rectangle is resolved through the SAME chain the real flow
+  // uses, but with only the manual provider in it: the chain tries the cache
+  // and the fixtures FIRST, so leaving them in would let a request for a
+  // specific small box silently resolve to the whole city instead.
   // ---------------------------------------------------------------------
-  if (!input.testBbox) {
-    throw new SearchLimitError(
-      "maxAreaKm2",
-      "Phase 3B still requires an explicit test rectangle. Automatic city resolution needs the Geocoding provider, which is not enabled.",
-    );
-  }
-
-  const resolution = await resolveBbox(
-    {
-      country: input.country.trim(),
-      state,
-      city: input.city.trim(),
-      manualBbox: input.testBbox,
-      userId: context.userId,
-    },
-    { providers: [new ManualBboxProvider()], persist: false },
-  );
+  const resolution = input.testBbox
+    ? await resolveBbox(
+        {
+          country: input.country.trim(),
+          state,
+          city: input.city.trim(),
+          manualBbox: input.testBbox,
+          userId: context.userId,
+        },
+        { providers: [new ManualBboxProvider()], persist: false },
+      )
+    : // The standard chain: cache -> custom area -> (Geocoding, Places viewport,
+      // both SKIPPED while EXTERNAL_PROVIDERS_ENABLED is false) -> fixture ->
+      // manual entry. Zero external calls either way; the two Google providers
+      // are not invoked, they are stepped over.
+      await resolveBbox(
+        {
+          country: input.country.trim(),
+          state,
+          city: input.city.trim(),
+          customAreaId: input.customAreaId ?? null,
+          userId: context.userId,
+        },
+        { db },
+      );
 
   const location = resolution.location;
   const bbox = location.bbox;
@@ -115,21 +124,21 @@ export async function createSearch(
   const areaKm2 = bboxAreaKm2(bbox);
 
   // ---------------------------------------------------------------------
-  // 2. Phase 3B guard rails, enforced on the server. A value typed into the
-  //    browser cannot widen these.
+  // 2. Server-side guard rails. A value typed into the browser cannot widen
+  //    any of these.
   // ---------------------------------------------------------------------
-  if (areaKm2 > PHASE_3B_LIMITS.maxAreaKm2) {
+  if (areaKm2 > SEARCH_LIMITS.maxAreaKm2) {
     throw new SearchLimitError(
       "maxAreaKm2",
-      `The test area is ${areaKm2.toFixed(1)} km², over the Phase 3B limit of ${PHASE_3B_LIMITS.maxAreaKm2} km². ` +
-        `Houston's full bounding box is roughly 3,700 km²; this phase proves the grid engine on a district, not a city.`,
+      `The requested area is ${areaKm2.toFixed(1)} km², over the limit of ${SEARCH_LIMITS.maxAreaKm2} km². ` +
+        `A whole metropolitan bounding box is roughly 3,700 km²; anything larger is a region, not a city.`,
     );
   }
 
-  if (input.targetLeads > PHASE_3B_LIMITS.maxTargetLeads) {
+  if (input.targetLeads > SEARCH_LIMITS.maxTargetLeads) {
     throw new SearchLimitError(
       "maxTargetLeads",
-      `Target of ${input.targetLeads} exceeds the Phase 3B limit of ${PHASE_3B_LIMITS.maxTargetLeads} leads.`,
+      `Target of ${input.targetLeads} exceeds the limit of ${SEARCH_LIMITS.maxTargetLeads} leads.`,
     );
   }
 
@@ -137,23 +146,24 @@ export async function createSearch(
   // 3. The frozen definition.
   //
   // The grid config recorded here describes what will ACTUALLY happen, capped
-  // to the phase limits. Storing the raw defaults would leave the row claiming
-  // a 400-tile, depth-3 plan this phase will never run.
+  // to the server limits. Storing the raw request would leave the row claiming
+  // a plan the runner would never carry out.
+  //
+  // It is frozen from here on. The single exception is `stopOnTargetReached`,
+  // which `amendStopPolicy` may flip -- explicitly, once, on a user's press --
+  // for rows created before the target stopped being a termination condition.
   // ---------------------------------------------------------------------
   const requested = { ...DEFAULT_GRID_CONFIG, ...input.gridConfig };
 
   const gridConfig = {
     ...requested,
-    minSeedTiles: Math.min(requested.minSeedTiles, PHASE_3B_LIMITS.maxSeedTiles),
-    maxSeedTiles: Math.min(requested.maxSeedTiles, PHASE_3B_LIMITS.maxSeedTiles),
-    maxSubdivisionDepth: Math.min(
-      requested.maxSubdivisionDepth,
-      PHASE_3B_LIMITS.maxSubdivisionDepth,
-    ),
-    phase: "3B-controlled" as const,
-    maxPagesPerTile: PHASE_3B_LIMITS.maxPagesPerTile,
-    maxAttemptsPerPage: PHASE_3B_LIMITS.maxAttemptsPerPage,
-    maxCallsPerSearch: PHASE_3B_LIMITS.maxCallsPerSearch,
+    minSeedTiles: Math.min(requested.minSeedTiles, SEARCH_LIMITS.maxSeedTiles),
+    maxSeedTiles: Math.min(requested.maxSeedTiles, SEARCH_LIMITS.maxSeedTiles),
+    maxSubdivisionDepth: Math.min(requested.maxSubdivisionDepth, SEARCH_LIMITS.maxSubdivisionDepth),
+    phase: "4" as const,
+    maxPagesPerTile: SEARCH_LIMITS.maxPagesPerTile,
+    maxAttemptsPerPage: SEARCH_LIMITS.maxAttemptsPerPage,
+    maxCallsPerSearch: SEARCH_LIMITS.maxCallsPerSearch,
   };
 
   // Coverage-first sizing, from the rectangle and the seed edge alone.
@@ -163,17 +173,17 @@ export async function createSearch(
     maxSeedTiles: gridConfig.maxSeedTiles,
   });
 
-  if (grid.tileCount > PHASE_3B_LIMITS.maxSeedTiles) {
+  if (grid.tileCount > SEARCH_LIMITS.maxSeedTiles) {
     // Unreachable while gridDimensions clamps to the same ceiling, kept because
     // a silently oversized grid is the one failure this phase cannot absorb.
     throw new SearchLimitError(
       "maxSeedTiles",
-      `The grid resolved to ${grid.tileCount} seed tiles, over the Phase 3B limit of ${PHASE_3B_LIMITS.maxSeedTiles}.`,
+      `The grid resolved to ${grid.tileCount} seed tiles, over the limit of ${SEARCH_LIMITS.maxSeedTiles}.`,
     );
   }
 
   const sku = pricing.classify(PLACES_FIELD_MASK).sku;
-  const label = `${locationLabel(input.city.trim(), state, input.country.trim())} · controlled test`;
+  const label = locationLabel(input.city.trim(), state, input.country.trim());
 
   const { data: search, error: searchError } = await db
     .from("searches")
@@ -258,7 +268,7 @@ export async function createSearch(
     level: report?.ok === false ? "error" : "info",
     code: "search_created",
     message:
-      `Controlled test created: ${grid.cols}×${grid.rows} = ${grid.tileCount} seed tile(s), ` +
+      `Search created: ${grid.cols}×${grid.rows} = ${grid.tileCount} seed tile(s), ` +
       `${grid.tileWidthKm.toFixed(2)}×${grid.tileHeightKm.toFixed(2)} km each, ` +
       `${areaKm2.toFixed(2)} km² total, target ${input.targetLeads} leads. ` +
       `Nothing has been requested from Google.`,
@@ -267,7 +277,7 @@ export async function createSearch(
       bbox,
       sku,
       pricing_version: pricing.getVersion(),
-      phase: "3B",
+      phase: "4",
       cols: grid.cols,
       rows: grid.rows,
       tile_count: grid.tileCount,

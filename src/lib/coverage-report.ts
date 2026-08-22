@@ -3,11 +3,15 @@ import { TILE_STATE_META, type TileState } from "@/lib/tile-states";
 /**
  * The honest account of what a run did and did not search.
  *
- * `stopOnTargetReached` means a search can legitimately finish having covered a
- * third of its rectangle. That is a feature -- but only if the report says so.
- * A run that stops at the target and then reports "completed" without naming
- * the geography it skipped is lying by omission, and every later decision made
- * from that lead list inherits the lie.
+ * A tick stops for budget, quota, time or error long before the geography is
+ * exhausted, so a search is very often paused with real area still owed. That
+ * is fine -- but only if the report says so. A run that stops early and then
+ * reports "completed" without naming the geography it skipped is lying by
+ * omission, and every later decision made from that lead list inherits the lie.
+ *
+ * `targetReached` is a METRIC here and nothing more. The lead target is a
+ * minimum desired benchmark; exceeding it is a result to report, never a reason
+ * a run ended. Completion is `fullyCovered` and only `fullyCovered`.
  *
  * So this module separates three things a tile count would blur together:
  *
@@ -171,7 +175,11 @@ function writeSummary(args: {
   const km = (value: number) => `${value.toFixed(1)} km²`;
   const pct = (value: number) => `${value.toFixed(1)}%`;
 
-  const lead = `${args.leadsFound} lead(s) found against a target of ${args.target}.`;
+  // The target is a benchmark, so the lead line REPORTS against it and never
+  // explains an ending with it.
+  const lead =
+    `${args.leadsFound} lead(s) found against a minimum target of ${args.target}` +
+    (args.targetReached ? " (target met)." : ".");
 
   if (args.fullyCovered) {
     return (
@@ -190,9 +198,8 @@ function writeSummary(args: {
   if (owed.tiles > 0) {
     parts.push(
       `THIS SEARCH DID NOT COVER THE WHOLE AREA: ${km(owed.areaKm2)} ` +
-        `(${pct(owed.pct)}) across ${owed.tiles} tile(s) was never searched` +
-        (args.targetReached ? " because the lead target was reached first." : ".") +
-        " That work is still owed and resumes on the next run.",
+        `(${pct(owed.pct)}) across ${owed.tiles} tile(s) was never searched. ` +
+        "That work is still owed and resumes on the next run.",
     );
   }
 

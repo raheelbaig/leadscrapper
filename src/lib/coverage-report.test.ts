@@ -54,7 +54,7 @@ describe("full coverage", () => {
   });
 });
 
-describe("a run that stopped at the lead target", () => {
+describe("a run that met the lead target but not the geography", () => {
   const tiles = [
     tile("covered", 42.4),
     tile("covered", 42.4),
@@ -66,7 +66,7 @@ describe("a run that stopped at the lead target", () => {
 
   const report = buildCoverageReport({ tiles, target: 40, leadsFound: 43 });
 
-  it("reports the target as reached", () => {
+  it("reports the target as met, as a metric", () => {
     expect(report.targetReached).toBe(true);
     expect(report.leadsFound).toBe(43);
     expect(report.target).toBe(40);
@@ -85,11 +85,25 @@ describe("a run that stopped at the lead target", () => {
     expect(report.owed.pct).toBeCloseTo(66.67, 1);
   });
 
-  it("shouts about it in the summary, and says why", () => {
+  it("shouts about it in the summary", () => {
     expect(report.summary).toMatch(/THIS SEARCH DID NOT COVER THE WHOLE AREA/);
     expect(report.summary).toMatch(/169\.6 km²/);
-    expect(report.summary).toMatch(/lead target was reached first/);
     expect(report.summary).toMatch(/still owed/);
+  });
+
+  it("never offers the lead target as the reason for the gap", () => {
+    // The phrase "because the lead target was reached first" used to appear
+    // here. It was the report agreeing with a behaviour that has been removed:
+    // the target is a minimum, and it can no longer end a run, so it can no
+    // longer explain one either.
+    expect(report.summary).not.toMatch(/target was reached first/i);
+    expect(report.summary).not.toMatch(/because .*target/i);
+  });
+
+  it("still reports the target being met, as a result rather than an ending", () => {
+    expect(report.summary).toMatch(
+      /43 lead\(s\) found against a minimum target of 40 \(target met\)/,
+    );
   });
 
   it("lists the tiles that were skipped, largest first", () => {
@@ -104,7 +118,7 @@ describe("a run that stopped at the lead target", () => {
   });
 });
 
-describe("a run that stopped without reaching the target", () => {
+describe("a run that stopped below the target", () => {
   it("does not blame the target for the gap", () => {
     const report = buildCoverageReport({
       tiles: [tile("covered", 50), tile("pending", 50)],

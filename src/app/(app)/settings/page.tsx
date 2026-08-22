@@ -1,7 +1,6 @@
 import { ShieldCheck } from "lucide-react";
 import type { Metadata } from "next";
 
-import { PhaseNotice } from "@/components/common/phase-notice";
 import { PageHeader } from "@/components/layout/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -55,7 +54,11 @@ export default async function SettingsPage() {
               }
               hint="Not a toggle. There is no paid path in this application."
             />
-            <Row label="Billing timezone" value={catalog.billingTimezone} hint="Monthly quota reset" />
+            <Row
+              label="Billing timezone"
+              value={catalog.billingTimezone}
+              hint="Monthly quota reset"
+            />
           </CardContent>
         </Card>
 
@@ -66,7 +69,11 @@ export default async function SettingsPage() {
           </CardHeader>
           <CardContent>
             <Row label="Results per page" value={PAGE_SIZE} />
-            <Row label="Max pages per query" value={MAX_PAGES} hint="Each page is a billable call" />
+            <Row
+              label="Max pages per query"
+              value={MAX_PAGES}
+              hint="Each page is a billable call"
+            />
             <Row label="Result ceiling per tile" value={RESULT_CEILING} />
             <Row
               label="Saturation threshold"
@@ -102,16 +109,25 @@ export default async function SettingsPage() {
             value={`${DEFAULT_GRID_CONFIG.minTileEdgeKm} km`}
             hint="A saturated tile at this size becomes a permanent recorded gap"
           />
-          <Row label="Seed tile clamp" value={`${DEFAULT_GRID_CONFIG.minSeedTiles}–${DEFAULT_GRID_CONFIG.maxSeedTiles}`} />
-          <Row label="Stop when target reached" value={String(DEFAULT_GRID_CONFIG.stopOnTargetReached)} />
+          <Row
+            label="Seed tile clamp"
+            value={`${DEFAULT_GRID_CONFIG.minSeedTiles}–${DEFAULT_GRID_CONFIG.maxSeedTiles}`}
+          />
+          <Row
+            label="Stop when target reached"
+            value={String(DEFAULT_GRID_CONFIG.stopOnTargetReached)}
+            hint="The lead target is a minimum, not a stopping point — a search finishes when its area is covered"
+          />
         </CardContent>
       </Card>
 
-      <PhaseNotice phase="Phase 2+ — editable settings">
-        These read from the shared defaults today. Saving per-account overrides and managing custom
-        areas (for example Greater Houston instead of Houston city proper) is wired alongside the
-        bounding-box resolver.
-      </PhaseNotice>
+      <p className="text-muted-foreground rounded-xl border p-4 text-sm">
+        These are read-only, and show the shared defaults every new search inherits. Per-search
+        overrides are set on the create form; saving per-account overrides and managing custom areas
+        (for example Greater Houston rather than Houston city proper) is not built yet. Nothing on
+        this page is editable, so nothing here can widen a limit — the execution limits are read
+        from the server on every run and are not settings at all.
+      </p>
     </>
   );
 }

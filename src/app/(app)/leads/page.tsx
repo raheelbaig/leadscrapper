@@ -2,7 +2,6 @@ import { Users } from "lucide-react";
 import type { Metadata } from "next";
 
 import { EmptyState } from "@/components/common/empty-state";
-import { PhaseNotice } from "@/components/common/phase-notice";
 import { PageHeader } from "@/components/layout/page-header";
 import { Card, CardContent } from "@/components/ui/card";
 import {
@@ -103,10 +102,14 @@ export default async function LeadsPage() {
         </Card>
       )}
 
-      <PhaseNotice phase="Phase 5 — lead management">
-        Filtering, sorting, server-side pagination, the detail sheet and bulk export selection land
-        here once searches are producing data.
-      </PhaseNotice>
+      <p className="text-muted-foreground rounded-xl border p-4 text-sm">
+        The 200 most recent leads across every search. Deduplication is a unique index on{" "}
+        <code className="text-xs">(search_id, place_id)</code> in the database rather than an
+        in-memory set, so a lead cannot be counted twice by a resume or by two ticks running back to
+        back. Export a workbook from the search that produced them — every export carries its own
+        Coverage worksheet saying what area it does and does not account for, which a combined list
+        like this one cannot.
+      </p>
     </>
   );
 }

@@ -1,45 +1,61 @@
 import "server-only";
 
 /**
- * Phase 3B guard rails.
+ * The Phase 4 spending envelope.
  *
- * Phase 3A could bound its cost with geometry alone: one tile, one page, one
- * attempt is one call, and there is nothing to argue about. Pagination,
- * multi-tile grids and recursive subdivision destroy that property. Six seed
- * tiles subdivided to depth 3 is 6 x (1+4+16+64) = 510 tiles, and at three
- * pages and three attempts each that is 4,590 billable calls -- from a
- * rectangle small enough to look harmless.
+ * Phase 3B could lean on geometry and a tiny budget: one tile per press, forty
+ * calls per search, and a lead target that stopped the run early. Phase 4
+ * removes the last of those on purpose -- the target is a benchmark now, not a
+ * termination condition (see `stopOnTargetReached`), so a search runs until the
+ * GEOGRAPHY is accounted for.
  *
- * So this phase adds a limit that geometry cannot supply: a HARD CALL BUDGET,
- * enforced inside the tick loop against `searches.api_calls_run`. It is the
- * number the pre-flight reports as the guaranteed maximum, because it is the
- * one that actually binds.
+ * That makes `maxCallsPerSearch` the only thing standing between a single press
+ * and the month's free allowance. It is therefore the one number here that was
+ * approved explicitly rather than derived:
+ *
+ *   APPROVED 2026-08-22: 150 calls per search.
+ *
+ * 150 of the ~943 protected Enterprise calls remaining is roughly a sixth of
+ * the month. A full city at an 8 km seed edge is about 90 seed tiles, which at
+ * the learned ~1.2 pages per tile costs roughly 110 calls -- so 150 covers one
+ * real city with subdivision headroom, and still leaves the month able to
+ * absorb several more searches. A higher ceiling was proposed and deliberately
+ * rejected. Raising it is a spending decision, not a tuning decision.
  *
  * Everything here is enforced on the SERVER, in `createSearch` and in the tick
- * runner. A value typed into the browser cannot widen any of it, and the API
- * route passes no options at all.
+ * runner, and every option is clamped with `Math.min(option ?? CAP, CAP)` so an
+ * option can only ever LOWER a limit. The run route passes no options at all.
  */
-export const PHASE_3B_LIMITS = {
+export const SEARCH_LIMITS = {
   // --- geometry ----------------------------------------------------------
-  /** The controlled band is 4-9 seed tiles, derived from the bbox. */
-  maxSeedTiles: 9,
   /**
-   * Subdivision depth for a Phase 3B search.
+   * Seed tiles one search may lay down.
    *
-   * ONE, not the production 3. Depth 1 exercises both subdivision rules in
-   * full -- R4a splits a saturated parent into four children, and a child that
-   * saturates at depth 1 hits the floor as R4b -- while keeping the worst case
-   * two orders of magnitude below what depth 3 allows. The engine and its tests
-   * support the production depth; only the controlled run is capped.
+   * The production figure, matching `DEFAULT_GRID_CONFIG`. A full city at an
+   * 8 km seed edge is roughly 90 tiles, so this is headroom rather than a
+   * target -- and it costs nothing, because laying down a grid is free. Only
+   * searching bills, and `maxCallsPerSearch` is what bounds that.
    */
-  maxSubdivisionDepth: 1,
+  maxSeedTiles: 400,
   /**
-   * ~300 km2 is a district, not a city: Houston's full bounding box is roughly
-   * 3,700 km2, so this still refuses anything close to a full-city crawl.
+   * Recursive subdivision depth.
+   *
+   * THREE, the production depth. A saturated seed tile splits into four, and
+   * each child may split again twice more, which is what lets a dense city
+   * block be resolved below the 60-result ceiling instead of being written off
+   * as a permanent gap.
    */
-  maxAreaKm2: 300,
-  /** The controlled band is 30-50 leads. */
-  maxTargetLeads: 50,
+  maxSubdivisionDepth: 3,
+  /**
+   * ~5,000 km2 admits a whole metropolitan bounding box -- Houston's is roughly
+   * 3,700 km2 -- while still refusing a region or a country by accident.
+   */
+  maxAreaKm2: 5_000,
+  /**
+   * The lead target is a MINIMUM DESIRED BENCHMARK and does not stop a search,
+   * so this cap only stops a nonsensical figure being recorded against a run.
+   */
+  maxTargetLeads: 10_000,
 
   // --- per page ----------------------------------------------------------
   /**
@@ -48,9 +64,7 @@ export const PHASE_3B_LIMITS = {
    */
   maxPagesPerTile: 3,
   /**
-   * Attempts for ONE page. Raised from the Phase 3A cap of 1, deliberately and
-   * alongside pagination, because a bounded retry is how a transient 429 or 5xx
-   * stops costing a whole tile.
+   * Attempts for ONE page.
    *
    * Every attempt re-enters `reserve_api_calls()`. A retry is a second billable
    * request, so it must pass the budget guard again -- which is why the retry
@@ -60,48 +74,50 @@ export const PHASE_3B_LIMITS = {
 
   // --- per run -----------------------------------------------------------
   /**
-   * Tiles one press of Run may process.
+   * Tiles one tick may process.
    *
-   * ONE for the first controlled run: one tile per press makes resume trivially
-   * auditable -- press, read the tile row, press again -- and makes the resume
-   * path a real observed behaviour rather than a staged one. Raise it once the
-   * first run has succeeded.
+   * TWELVE. At roughly 1.2s per request plus the mandated 2s token delay before
+   * any second or third page, the wall-clock budget below binds long before
+   * this does -- which is the intent. This is the structural ceiling; time is
+   * the practical one.
    */
-  maxTilesPerTick: 1,
+  maxTilesPerTick: 12,
   /**
-   * Billable calls one press may make.
+   * Billable calls one tick may make.
    *
-   * NINE, which is exactly what the other limits already permit:
-   * 1 tile x 3 pages x 3 attempts. Set to the true ceiling rather than to a
-   * comfortable round number above it, so the limit states the real bound
-   * instead of leaving eleven calls of unexplained headroom -- headroom that a
+   * Exactly what the other limits already permit: 12 tiles x 3 pages x 3
+   * attempts. Pinned to the DERIVED ceiling rather than a round number above
+   * it, so the limit states the real bound instead of leaving headroom that a
    * later change to the tile cap would silently convert into spending.
-   *
-   * It is therefore exactly binding today and restricts nothing: the tile
-   * budget stops the loop first. Raising maxTilesPerTick means revisiting this
-   * deliberately, which is the point.
    */
-  maxCallsPerTick: 9,
+  maxCallsPerTick: 108,
   /**
    * THE spending ceiling for one search, cumulative across every resume.
    *
    * Checked against `searches.api_calls_run`, which `record_api_call` maintains
    * -- so it counts calls that were actually made, including the ones kept
    * rather than refunded after an HTTP error. This is the number the pre-flight
-   * reports as the guaranteed maximum.
+   * reports as the guaranteed maximum, and since Phase 4 removed the target as
+   * a stop condition it is the ONLY ceiling that bounds a search's cost.
+   *
+   * Approved value. See the module comment before changing it.
    */
-  maxCallsPerSearch: 40,
+  maxCallsPerSearch: 150,
   /**
    * Wall-clock budget for one tick.
    *
-   * A three-page tile costs roughly 2s of mandated token delay plus ~1.2s of
-   * request per page. Expiring is not a failure: the run pauses with the
-   * geography still owed and the next press continues from there.
+   * The manual run route declares `maxDuration = 60`, so 50s leaves the runner
+   * room to write its final state rather than being cut off mid-report.
+   * Expiring is not a failure: the run pauses with the geography still owed and
+   * the next tick continues from there.
+   *
+   * The background worker passes a SHORTER slice through the clamped option, so
+   * it can lower this but never raise it.
    */
   maxTickMs: 50_000,
 } as const;
 
-export type SearchLimit = keyof typeof PHASE_3B_LIMITS;
+export type SearchLimit = keyof typeof SEARCH_LIMITS;
 
 export class SearchLimitError extends Error {
   readonly limit: SearchLimit;

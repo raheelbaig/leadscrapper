@@ -20,6 +20,17 @@ import { NETWORK_GUARD_MESSAGE } from "./setup";
  */
 
 const LIVE = process.env.LEAD_SCRAPPER_LIVE_GOOGLE === "1";
+/**
+ * The database suite is opt-in and needs a WORKING `fetch`, because supabase-js
+ * uses it. `setup.ts` therefore restores the platform fetch in this mode and
+ * installs the throwing guard in every other one.
+ *
+ * The network-guard assertion below has to know that. It previously did not,
+ * and failed whenever the whole suite was run with LEAD_SCRAPPER_DB_TESTS=1 --
+ * invisibly, because the documented way to run the database suite named the
+ * `.db.test.ts` files explicitly and never reached this file.
+ */
+const DB_TESTS = process.env.LEAD_SCRAPPER_DB_TESTS === "1";
 const DUMMY_KEY = "test-google-api-key-not-real";
 
 const BBOX = { minLat: 29.74, minLng: -95.38, maxLat: 29.77, maxLng: -95.35 };
@@ -62,8 +73,18 @@ describe.skipIf(LIVE)("default mode: Google is unreachable", () => {
     }
   });
 
-  it("blocks the network at the global fetch", () => {
+  it.skipIf(DB_TESTS)("blocks the network at the global fetch", () => {
     expect(() => (globalThis.fetch as unknown as () => void)()).toThrow(NETWORK_GUARD_MESSAGE);
+  });
+
+  it.skipIf(!DB_TESTS)("keeps a working fetch for Supabase, but still a dummy Google key", () => {
+    // The database suite needs a real `fetch`, so the guard is deliberately not
+    // installed. Reaching the database and reaching Google stay two separate
+    // decisions: the key is still the dummy, so a request that escaped would be
+    // rejected by Google rather than billed.
+    expect(typeof globalThis.fetch).toBe("function");
+    expect(process.env.GOOGLE_MAPS_API_KEY).toBe(DUMMY_KEY);
+    expect(headerKey()).toBe(DUMMY_KEY);
   });
 });
 

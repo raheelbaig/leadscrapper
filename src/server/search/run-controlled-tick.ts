@@ -13,19 +13,37 @@ import { mapPlaces } from "@/server/places/lead-mapper";
 
 import { claimSearchById } from "./claim";
 import { classifyTile, type TileClassification } from "./classify-tile";
+import {
+  finalOutcome,
+  finalStatus,
+  nextStopReason,
+  type SearchTerminalStatus,
+  type TickOutcome,
+  type TickStopReason,
+} from "./completion";
 import { logSearchEvent } from "./events";
-import { PHASE_3B_LIMITS } from "./limits";
+import { SEARCH_LIMITS } from "./limits";
 import { runPreflight, SearchBlockedError, type PreflightResult } from "./preflight";
 import { paginateTile, type PaginateTileOptions } from "./tile-runner";
 
 /**
- * ONE bounded, manually triggered tick of the real pipeline.
+ * ONE bounded tick of the real pipeline.
  *
- * Phase 3B walks a grid: claim -> for each tile, pages 1..3 with the mandated
+ * A tick walks a grid: claim -> for each tile, pages 1..3 with the mandated
  * token delay -> map -> dedupe insert -> classify R1-R5 -> subdivide if
- * saturated -> release. It is still NOT the permanent worker. `private.
- * worker_config.enabled` is false, no cron job drives this, and a search runs
- * because a person pressed a button.
+ * saturated -> release.
+ *
+ * COMPLETION IS GEOGRAPHIC. The lead target is a minimum desired benchmark and
+ * does not end a search: a run that wanted 40 leads and has found 87 keeps
+ * working through its pending tiles, and finishes `completed` only when every
+ * leaf tile is accounted for. Coverage and the lead target are separate
+ * concepts and are never conflated here, in the UI, or in the export.
+ * `targetReached` is reported as a metric on every result and is not a stop
+ * reason.
+ *
+ * The same function serves the manual Run button and the background worker;
+ * the worker differs only in passing a shorter wall-clock slice, which the
+ * option clamps allow it to lower and not to raise.
  *
  * The order of the first two steps matters and is not an accident:
  *
@@ -55,26 +73,7 @@ import { paginateTile, type PaginateTileOptions } from "./tile-runner";
  * owned by `insert_leads_dedup`.
  */
 
-export type TickOutcome =
-  | "completed"
-  | "paused-tile-limit"
-  | "paused-call-budget"
-  | "paused-time-limit"
-  | "paused-quota"
-  | "paused-tile-error"
-  | "failed"
-  | "nothing-to-do";
-
-export type TickStopReason =
-  | "coverage_complete"
-  | "target_reached"
-  | "tile_budget_reached"
-  | "call_budget_reached"
-  | "tick_slice_expired"
-  | "quota_exhausted"
-  | "tile_error"
-  | "fatal_api_error"
-  | "lease_lost";
+export type { TickOutcome, TickStopReason } from "./completion";
 
 /** What one tile did, for the run summary and the toast. */
 export type TileRunSummary = {
@@ -122,6 +121,14 @@ export type RunControlledTickOptions = PaginateTileOptions & {
   leaseSeconds?: number;
   /** Never widens the phase cap -- both are clamped by it. */
   maxTilesPerTick?: number;
+  /**
+   * Wall-clock slice for this tick.
+   *
+   * Clamped like every other option, so the background worker can hand itself a
+   * SHORTER slice than the manual route takes but can never hand itself a
+   * longer one.
+   */
+  maxTickMs?: number;
   /** Injected in tests. Defaults to `Date.now`. */
   now?: () => number;
 };
@@ -145,7 +152,7 @@ function readGridConfig(raw: Json | null) {
     // written by an earlier phase must not be able to widen this one.
     maxSubdivisionDepth: Math.min(
       num("maxSubdivisionDepth", DEFAULT_GRID_CONFIG.maxSubdivisionDepth),
-      PHASE_3B_LIMITS.maxSubdivisionDepth,
+      SEARCH_LIMITS.maxSubdivisionDepth,
     ),
     minTileEdgeKm: num("minTileEdgeKm", DEFAULT_GRID_CONFIG.minTileEdgeKm),
     saturationRatio: num("saturationRatio", DEFAULT_GRID_CONFIG.saturationRatio),
@@ -181,19 +188,20 @@ export async function runControlledTick(
   // Every one of these is clamped by the phase cap, so an option cannot widen
   // it -- and the API route passes no options at all.
   const maxAttempts = Math.min(
-    options.maxAttempts ?? PHASE_3B_LIMITS.maxAttemptsPerPage,
-    PHASE_3B_LIMITS.maxAttemptsPerPage,
+    options.maxAttempts ?? SEARCH_LIMITS.maxAttemptsPerPage,
+    SEARCH_LIMITS.maxAttemptsPerPage,
   );
   const maxPages = Math.min(
-    options.maxPages ?? PHASE_3B_LIMITS.maxPagesPerTile,
-    PHASE_3B_LIMITS.maxPagesPerTile,
+    options.maxPages ?? SEARCH_LIMITS.maxPagesPerTile,
+    SEARCH_LIMITS.maxPagesPerTile,
   );
   const maxTiles = Math.min(
-    options.maxTilesPerTick ?? PHASE_3B_LIMITS.maxTilesPerTick,
-    PHASE_3B_LIMITS.maxTilesPerTick,
+    options.maxTilesPerTick ?? SEARCH_LIMITS.maxTilesPerTick,
+    SEARCH_LIMITS.maxTilesPerTick,
   );
+  const maxTickMs = Math.min(options.maxTickMs ?? SEARCH_LIMITS.maxTickMs, SEARCH_LIMITS.maxTickMs);
 
-  const callBudget = PHASE_3B_LIMITS.maxCallsPerSearch;
+  const callBudget = SEARCH_LIMITS.maxCallsPerSearch;
   const callsAlreadySpent = search.api_calls_run;
 
   // -----------------------------------------------------------------------
@@ -306,26 +314,41 @@ export async function runControlledTick(
     // 3. The tile loop.
     // -------------------------------------------------------------------
     for (;;) {
-      const budgetRemaining = callBudget - (callsAlreadySpent + callsThisTick);
+      // Pause and cancel are cooperative: the tick re-reads its own status
+      // every iteration rather than being killed mid-request, so it always
+      // stops between tiles with the lease released and nothing in flight.
+      const { data: control } = await db
+        .from("searches")
+        .select("status")
+        .eq("id", args.searchId)
+        .maybeSingle();
 
-      if (gridConfig.stopOnTargetReached && leadsFound >= search.target_leads) {
-        stop = "target_reached";
-        break;
-      }
-      if (budgetRemaining <= 0) {
-        stop = "call_budget_reached";
-        break;
-      }
-      if (callsThisTick >= PHASE_3B_LIMITS.maxCallsPerTick) {
-        stop = "call_budget_reached";
-        break;
-      }
-      if (tiles.length >= maxTiles) {
-        stop = "tile_budget_reached";
-        break;
-      }
-      if (now() - startedAt >= PHASE_3B_LIMITS.maxTickMs) {
-        stop = "tick_slice_expired";
+      // Every budget in one place, in a fixed order, tested without a database.
+      // Note what is NOT among them: the lead target. It is a minimum desired
+      // benchmark and cannot end a run.
+      //
+      // `stopOnTargetReached` is honoured only for a search created before
+      // 2026-08-22, whose frozen `grid_config` still carries the old policy.
+      // That row's definition is respected rather than silently rewritten --
+      // but it PAUSES rather than completing, because its geography is
+      // genuinely still owed, and "Continue to full coverage" is how a person
+      // amends it.
+      const reason = nextStopReason({
+        stopOnTargetReached: gridConfig.stopOnTargetReached,
+        leadsFound,
+        targetLeads: search.target_leads,
+        status: control?.status ?? "running",
+        callsRemainingInSearch: callBudget - (callsAlreadySpent + callsThisTick),
+        callsThisTick,
+        maxCallsPerTick: SEARCH_LIMITS.maxCallsPerTick,
+        tilesThisTick: tiles.length,
+        maxTilesPerTick: maxTiles,
+        elapsedMs: now() - startedAt,
+        maxTickMs,
+      });
+
+      if (reason) {
+        stop = reason;
         break;
       }
 
@@ -657,7 +680,7 @@ async function runOneTile(input: {
         await db.rpc("heartbeat_job", {
           p_search: search.id,
           p_worker: workerId,
-          p_status_text: `${tile.label}: page ${page.pageIndex + 1} of ${PHASE_3B_LIMITS.maxPagesPerTile}`,
+          p_status_text: `${tile.label}: page ${page.pageIndex + 1} of ${SEARCH_LIMITS.maxPagesPerTile}`,
           p_current_tile: tile.id,
           p_current_page: page.pageIndex + 1,
         });
@@ -890,39 +913,11 @@ async function loadCoverage(
   });
 }
 
-function finalStatus(stop: TickStopReason): "completed" | "paused" | "failed" {
-  if (stop === "fatal_api_error") return "failed";
-  if (stop === "coverage_complete" || stop === "target_reached") return "completed";
-  return "paused";
-}
-
-function finalOutcome(stop: TickStopReason, tilesProcessed: number): TickOutcome {
-  switch (stop) {
-    case "coverage_complete":
-      return tilesProcessed === 0 ? "nothing-to-do" : "completed";
-    case "target_reached":
-      return "completed";
-    case "quota_exhausted":
-      return "paused-quota";
-    case "call_budget_reached":
-      return "paused-call-budget";
-    case "tile_budget_reached":
-    case "lease_lost":
-      return "paused-tile-limit";
-    case "tick_slice_expired":
-      return "paused-time-limit";
-    case "tile_error":
-      return "paused-tile-error";
-    case "fatal_api_error":
-      return "failed";
-  }
-}
-
 async function finish(
   db: AdminDb,
   searchId: string,
   workerId: string,
-  status: "completed" | "paused" | "failed",
+  status: SearchTerminalStatus,
   stopReason: string,
   lastError: string | null,
 ): Promise<void> {

@@ -16,7 +16,7 @@ import {
   type QuotaClient,
 } from "@/server/quota/quota-service";
 
-import { PHASE_3B_LIMITS } from "./limits";
+import { SEARCH_LIMITS } from "./limits";
 
 /**
  * Fetches ONE page of Text Search results for one tile, under budget.
@@ -75,7 +75,7 @@ export type FetchTilePageArgs = {
   /** The niche alone. Never "niche in city". */
   textQuery: string;
   bbox: BoundingBox;
-  /** 0-based. Phase 3A only ever fetches page 0. */
+  /** 0-based, so pages 0..2 are Google's three-page ceiling. */
   pageIndex: number;
   pageToken?: string | null;
 };
@@ -103,8 +103,8 @@ export async function fetchTilePage(
   // spent this project's first real Google call, so the floor is enforced at
   // the lowest level that can spend one.
   const maxAttempts = Math.min(
-    options.maxAttempts ?? PHASE_3B_LIMITS.maxAttemptsPerPage,
-    PHASE_3B_LIMITS.maxAttemptsPerPage,
+    options.maxAttempts ?? SEARCH_LIMITS.maxAttemptsPerPage,
+    SEARCH_LIMITS.maxAttemptsPerPage,
   );
   const sleep = options.sleep ?? defaultSleep;
   const db = options.db;
@@ -328,8 +328,8 @@ export async function paginateTile(
   options: PaginateTileOptions = {},
 ): Promise<PaginateTileResult> {
   const maxPages = Math.min(
-    options.maxPages ?? PHASE_3B_LIMITS.maxPagesPerTile,
-    PHASE_3B_LIMITS.maxPagesPerTile,
+    options.maxPages ?? SEARCH_LIMITS.maxPagesPerTile,
+    SEARCH_LIMITS.maxPagesPerTile,
   );
   const sleep = options.sleep ?? defaultSleep;
   const pageDelayMs = options.pageDelayMs ?? PAGE_TOKEN_DELAY_MS;

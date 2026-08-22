@@ -8,7 +8,6 @@ import { useState } from "react";
 import { useForm, useWatch } from "react-hook-form";
 import { toast } from "sonner";
 
-import { PhaseNotice } from "@/components/common/phase-notice";
 import { PreflightPanel } from "@/components/search/preflight-panel";
 import {
   Accordion,
@@ -20,7 +19,6 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { DEFAULT_GRID_CONFIG } from "@/lib/constants";
 import { bboxAreaKm2, gridDimensions } from "@/lib/geo/bbox";
@@ -29,10 +27,12 @@ import { createSearchSchema, type CreateSearchInput } from "@/lib/schemas/search
 /**
  * A ~254 km2 rectangle over the Houston inner loop: about 15.5 x 16.4 km.
  *
- * Deliberately NOT the Houston city bounding box, which is roughly 3,700 km2
- * and would plan a 90-tile crawl. At the 8 km seed edge this box tiles into a
- * 3 x 2 grid -- six tiles, inside the controlled 4-9 band, and large enough per
- * tile that pagination to page 2 is actually exercised rather than theorised.
+ * The starting value, not a ceiling: the server now admits up to 5,000 km2, so
+ * the Houston city bounding box (~3,700 km2, a ~90-tile crawl) is a legitimate
+ * search. This box is the default because a small rectangle is the honest place
+ * to start when the per-search call budget is 150 -- at the 8 km seed edge it
+ * tiles into a 3 x 2 grid whose tiles are large enough that pagination to page
+ * 2 is actually exercised rather than theorised.
  */
 const HOUSTON_INNER_LOOP_TEST_BOX = {
   minLat: 29.69,
@@ -42,12 +42,12 @@ const HOUSTON_INNER_LOOP_TEST_BOX = {
 } as const;
 
 /**
- * Mirrors PHASE_3B_LIMITS. The server is authoritative and refuses anything
+ * Mirrors SEARCH_LIMITS. The server is authoritative and refuses anything
  * past these on its own; they are repeated here only so the form can warn
  * before a submission that would be rejected.
  */
-const PHASE_3B_MAX_AREA_KM2 = 300;
-const PHASE_3B_MAX_SEED_TILES = 9;
+const MAX_AREA_KM2 = 5_000;
+const MAX_SEED_TILES = 400;
 
 function FieldError({ message }: { message?: string }) {
   if (!message) return null;
@@ -79,7 +79,6 @@ export function SearchForm() {
     },
   });
 
-  const stopOnTarget = useWatch({ control, name: "gridConfig.stopOnTargetReached" });
   const testBbox = useWatch({ control, name: "testBbox" });
   const seedTileEdgeKm = useWatch({ control, name: "gridConfig.seedTileEdgeKm" });
 
@@ -107,8 +106,8 @@ export function SearchForm() {
     try {
       const grid = gridDimensions(box, {
         seedTileEdgeKm: edge,
-        minSeedTiles: Math.min(DEFAULT_GRID_CONFIG.minSeedTiles, PHASE_3B_MAX_SEED_TILES),
-        maxSeedTiles: PHASE_3B_MAX_SEED_TILES,
+        minSeedTiles: Math.min(DEFAULT_GRID_CONFIG.minSeedTiles, MAX_SEED_TILES),
+        maxSeedTiles: MAX_SEED_TILES,
       });
       return { areaKm2: bboxAreaKm2(box), grid };
     } catch {
@@ -158,8 +157,8 @@ export function SearchForm() {
         <CardHeader>
           <CardTitle>Search</CardTitle>
           <CardDescription>
-            The grid is built from the rectangle alone. Your lead target decides when to stop, never
-            how the area is divided.
+            The grid is built from the rectangle alone. Your lead target is a minimum you want to
+            reach — it decides neither how the area is divided nor when the search stops.
           </CardDescription>
         </CardHeader>
 
@@ -228,8 +227,10 @@ export function SearchForm() {
             />
             <FieldError message={errors.targetLeads?.message} />
             <p className="text-muted-foreground text-xs">
-              A city may simply not list this many businesses. Reaching full coverage without
-              hitting the target is a useful result, not a failure. Phase 3B caps this at 50.
+              A <span className="text-foreground font-medium">minimum</span>, not a stopping point.
+              The search works through the whole area regardless, so finding more than this is a
+              normal result — and covering the area without reaching it is a useful answer about the
+              market, not a failure.
             </p>
           </div>
         </CardContent>
@@ -239,11 +240,12 @@ export function SearchForm() {
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-base">
             <MapPin className="text-muted-foreground size-4" />
-            Controlled test area
+            Search area
           </CardTitle>
           <CardDescription>
-            Phase 3B searches a district, not a whole city. The grid is built from this box alone —
-            automatic city resolution needs the Geocoding provider, which is still off.
+            The grid is built from this rectangle alone. Automatic city resolution needs the
+            Geocoding provider, which is still off, so the box is entered explicitly and no external
+            call is made to work out where the city is.
           </CardDescription>
         </CardHeader>
 
@@ -281,7 +283,7 @@ export function SearchForm() {
               <p className="text-muted-foreground text-xs">
                 {plan === null
                   ? "Every minimum has to be below its matching maximum."
-                  : `${plan.grid.tileWidthKm.toFixed(2)}×${plan.grid.tileHeightKm.toFixed(2)} km each. The server refuses anything over ${PHASE_3B_MAX_AREA_KM2} km² or ${PHASE_3B_MAX_SEED_TILES} seed tiles in this phase.`}
+                  : `${plan.grid.tileWidthKm.toFixed(2)}×${plan.grid.tileHeightKm.toFixed(2)} km each. The server refuses anything over ${MAX_AREA_KM2} km² or ${MAX_SEED_TILES} seed tiles.`}
               </p>
             </div>
             <Button
@@ -335,7 +337,7 @@ export function SearchForm() {
                   {...register("gridConfig.maxSubdivisionDepth")}
                 />
                 <p className="text-muted-foreground text-xs">
-                  How many times a saturated tile may split into four. Phase 3B caps this at 1.
+                  How many times a saturated tile may split into four. The server caps this at 3.
                 </p>
               </div>
               <div className="space-y-2">
@@ -352,36 +354,36 @@ export function SearchForm() {
               </div>
             </div>
 
-            <div className="flex items-start justify-between gap-4 rounded-lg border p-3">
-              <div className="space-y-0.5">
-                <Label htmlFor="stopOnTargetReached">Stop when the target is reached</Label>
-                <p className="text-muted-foreground text-xs">
-                  On: stop early and report exactly which areas went unsearched. Off: sweep the
-                  whole city regardless of the target.
-                </p>
-              </div>
-              <Switch
-                id="stopOnTargetReached"
-                checked={!!stopOnTarget}
-                onCheckedChange={(checked) =>
-                  setValue("gridConfig.stopOnTargetReached", checked, { shouldDirty: true })
-                }
-              />
-            </div>
+            {/*
+              There is deliberately no "stop when the target is reached" switch.
+              The lead target is a minimum desired benchmark; a search finishes
+              when its geography is covered. Offering the old behaviour as an
+              option would put back the exact thing that made a 51-lead run over
+              83% of its area report itself as complete.
+
+              The field still exists in the schema, because searches created
+              before 2026-08-22 froze the old policy and are honoured as
+              recorded until their owner presses "Continue to full coverage".
+            */}
+            <p className="text-muted-foreground rounded-lg border p-3 text-xs">
+              <span className="text-foreground font-medium">Completion is geographic.</span> This
+              search will keep working through its tiles until the area is covered, the call budget
+              is spent, or the free allowance runs out — never because the lead target was met.
+            </p>
           </AccordionContent>
         </AccordionItem>
       </Accordion>
 
-      <PhaseNotice phase="Phase 3A — controlled test">
+      <p className="text-muted-foreground rounded-xl border p-4 text-sm">
         Creating a search costs nothing: it plans the grid and writes the rows, and makes no Google
-        request. Running it is a separate, explicit action on the search page, and it fetches a
-        single page of a single tile.
-      </PhaseNotice>
+        request at all. Running it is a separate, explicit action on the search page, and every page
+        of every tile is reserved against the free allowance before it is requested.
+      </p>
 
       <div className="flex justify-end gap-2">
         <Button type="submit" size="lg" disabled={submitting} className="gap-2">
           {submitting ? <Loader2 className="size-4 animate-spin" /> : null}
-          {submitting ? "Creating…" : "Create controlled test"}
+          {submitting ? "Creating…" : "Create search"}
         </Button>
       </div>
     </form>

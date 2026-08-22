@@ -4,6 +4,7 @@ import Link from "next/link";
 
 import { EmptyState } from "@/components/common/empty-state";
 import { PageHeader } from "@/components/layout/page-header";
+import { SearchActionsMenu } from "@/components/search/search-actions";
 import { SearchStatusBadge } from "@/components/search/search-status-badge";
 import { buttonVariants } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -28,7 +29,7 @@ export default async function SearchesPage() {
     <>
       <PageHeader
         title="Searches"
-        description="Every search is a durable job. Pausing, closing the browser, or a server restart does not lose progress."
+        description="Every search is a durable job that finishes when its area is covered — the lead target is a minimum, not a stopping point. Pausing, closing the browser, or a server restart does not lose progress."
         actions={
           <Link href="/find-leads" className={buttonVariants({ size: "lg" })}>
             Find New Leads
@@ -58,6 +59,7 @@ export default async function SearchesPage() {
                     <TableHead className="text-right">Coverage</TableHead>
                     <TableHead className="text-right">API calls</TableHead>
                     <TableHead className="text-right">Created</TableHead>
+                    <TableHead className="w-10" aria-label="Actions" />
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -74,7 +76,10 @@ export default async function SearchesPage() {
                       </TableCell>
                       <TableCell className="text-right tabular-nums">
                         {formatNumber(s.leads_found)}
-                        <span className="text-muted-foreground"> / {formatNumber(s.target_leads)}</span>
+                        <span className="text-muted-foreground">
+                          {" "}
+                          / {formatNumber(s.target_leads)}
+                        </span>
                       </TableCell>
                       <TableCell
                         className={cn(
@@ -89,6 +94,13 @@ export default async function SearchesPage() {
                       </TableCell>
                       <TableCell className="text-muted-foreground text-right">
                         {formatDate(s.created_at)}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <SearchActionsMenu
+                          searchId={s.id}
+                          status={s.status}
+                          leadCount={s.leads_found}
+                        />
                       </TableCell>
                     </TableRow>
                   ))}

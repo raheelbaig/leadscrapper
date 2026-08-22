@@ -13,14 +13,14 @@ import { formatNumber } from "@/lib/format";
 /**
  * The manual trigger for one bounded tick.
  *
- * Phase 3B has no cron-driven worker: `private.worker_config.enabled` is false
- * and nothing in the application turns it on. A search runs because a person
- * pressed this button, and one press processes ONE tile — up to three pages,
- * each with its own quota reservation.
+ * One press works through pending tiles until a budget stops it: the tile cap,
+ * the per-tick call cap, the per-SEARCH call budget, or the wall-clock slice.
+ * Whichever binds first wins, and the run pauses with the remaining geography
+ * still owed and visible.
  *
- * One tile per press is deliberate. It makes resume trivially auditable: press,
- * read the tile row, press again. It also means the geography left unsearched
- * is visible between presses rather than only at the end.
+ * IT DOES NOT STOP AT THE LEAD TARGET. The target is a minimum desired
+ * benchmark; a search finishes when the area is covered. A press that finds
+ * more leads than the target asked for keeps going.
  *
  * The button disables itself while a tick is in flight. That is a courtesy, not
  * the safety mechanism: the real guard against two concurrent runs is the
@@ -52,20 +52,31 @@ type RunResult = {
   duplicatesRejected: number;
   leadsFound: number;
   targetLeads: number;
+  targetReached: boolean;
   coverage: { tilesRemaining: number; summary: string; fullyCovered: boolean };
 };
 
-/** Plain-English endings, so a pause never looks like a failure. */
+/**
+ * Plain-English endings, so a pause never looks like a failure.
+ *
+ * Note what is NOT here: an ending that says the lead target stopped the run.
+ * `stopped_at_target` exists only for searches created before the target became
+ * a benchmark, and its wording says plainly that geography is still owed.
+ */
 const STOP_REASON_TEXT: Record<string, string> = {
-  coverage_complete: "Every tile has been searched.",
-  target_reached: "The lead target was reached — remaining tiles were not searched.",
-  tile_budget_reached: "One tile per press. Press Run again to continue.",
+  coverage_complete: "Every tile has been searched. This search is complete.",
+  tile_budget_reached: "The tick reached its tile limit. Press Run again to continue.",
   call_budget_reached: "This search has spent its call budget.",
   tick_slice_expired: "The run reached its time slice. Press Run again to continue.",
   quota_exhausted: "The protected free allowance is spent.",
   tile_error: "A tile failed. It returns to pending and retries on the next press.",
   fatal_api_error: "Google rejected the request in a way that will not fix itself.",
   lease_lost: "Another runner took over this search.",
+  paused_by_user: "Paused. The remaining tiles are still owed.",
+  canceled: "Canceled. The remaining tiles were not searched.",
+  stopped_at_target:
+    "This search was created with the old policy and stopped at its lead target — " +
+    "the remaining area was NOT searched. Use “Continue to full coverage” to finish it.",
 };
 
 export function RunSearchButton({
@@ -112,23 +123,36 @@ export function RunSearchButton({
       }
 
       const result = payload as RunResult;
-      const tile = result.tiles.at(-1);
+      const tilesDone = result.tiles.length;
 
-      const headline = tile ? `${tile.tileLabel} · ${tile.state}` : "Nothing left to do";
+      const headline =
+        tilesDone === 0
+          ? "Nothing left to do"
+          : `${formatNumber(tilesDone)} tile(s) searched · ${formatNumber(result.leadsInserted)} new lead(s)`;
+
       const detail =
-        (tile
-          ? `${formatNumber(tile.pagesFetched)} page(s) · ` +
-            `${formatNumber(result.resultsReceived)} result(s) · ` +
-            `${formatNumber(result.leadsInserted)} new lead(s)` +
+        (tilesDone > 0
+          ? `${formatNumber(result.resultsReceived)} result(s)` +
             (result.duplicatesRejected > 0
               ? ` · ${formatNumber(result.duplicatesRejected)} duplicate(s) rejected`
               : "") +
-            (tile.childrenCreated > 0 ? ` · split into ${tile.childrenCreated} tiles` : "") +
             ` · ${formatNumber(result.apiCalls)} API call(s)`
           : "") + `\n${STOP_REASON_TEXT[result.stopReason] ?? result.stopReason}`;
 
       const notify = result.outcome === "failed" ? toast.error : toast.success;
       notify(headline, { description: detail });
+
+      // Exceeding the target is a RESULT, reported on its own. It is never
+      // presented as the reason a run ended, because it is not one.
+      if (result.targetReached && result.leadsFound > result.targetLeads) {
+        toast.info(
+          `${formatNumber(result.leadsFound)} leads — past the ${formatNumber(result.targetLeads)} you asked for`,
+          {
+            description:
+              "The target is a minimum. The search keeps going until the area is covered.",
+          },
+        );
+      }
 
       if (!result.coverage.fullyCovered && result.coverage.tilesRemaining > 0) {
         toast.warning(`${result.coverage.tilesRemaining} tile(s) still unsearched`, {
@@ -162,18 +186,21 @@ export function RunSearchButton({
       >
         {running ? <Loader2 className="size-4 animate-spin" /> : <Play className="size-4" />}
         {running
-          ? "Running one tile…"
+          ? "Searching…"
           : alreadyFinished
-            ? "Finished"
+            ? status === "completed"
+              ? "Complete"
+              : "Canceled"
             : outOfBudget
               ? "Call budget spent"
               : nothingLeft
                 ? "No tiles left"
-                : "Run one tile"}
+                : "Run"}
       </Button>
 
       <p className="text-muted-foreground text-xs">
-        One tile per press, up to 3 pages, each page separately reserved against the free allowance.{" "}
+        Each press works through pending tiles until a budget or the time slice stops it. Up to 3
+        pages per tile, each page separately reserved against the free allowance.{" "}
         {formatNumber(tilesRemaining)} tile(s) still owed · {formatNumber(budgetRemaining)} call(s)
         left in this search&rsquo;s budget.
       </p>
