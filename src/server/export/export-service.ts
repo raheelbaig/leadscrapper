@@ -26,6 +26,20 @@ import { buildWorkbook, type ExportMeta } from "./workbook";
  * server-side; no object is ever public.
  *
  * MAKES NO GOOGLE REQUEST. Exporting reads rows that were already paid for.
+ *
+ * READ-ONLY WITH RESPECT TO THE SEARCH. Generating a document must not change
+ * the thing it documents. This module writes exactly two things -- the
+ * `exports` row it owns and the object in Storage -- and touches nothing on
+ * `searches`, `search_tiles`, `leads`, the usage counters or the call log.
+ *
+ * That property is named here because it was broken once. An earlier version
+ * called `verify_search_coverage()` to put the grid invariant on the Coverage
+ * sheet. It reads like a query and is not: it WRITES its verdict to
+ * `searches.coverage_report`, which trips the `updated_at` trigger -- and since
+ * `searches` is in the Realtime publication, every export nudged open browser
+ * tabs into a refresh. The invariant is now READ from the stored report the
+ * runner already produced on every tick. `export.db.test.ts` compares the whole
+ * search row before and after and fails on any difference at all.
  */
 
 type AdminDb = ReturnType<typeof getSupabaseAdminClient>;
@@ -134,14 +148,35 @@ export async function createSearchExport(
   const storagePath = `${args.userId}/${exportId}.xlsx`;
 
   try {
-    const [leads, { data: tiles }, { data: invariant }] = await Promise.all([
+    const [leads, { data: tiles }] = await Promise.all([
       loadAllLeads(db, args.searchId),
       db
         .from("search_tiles")
         .select("label, state, area_km2, depth")
         .eq("search_id", args.searchId),
-      db.rpc("verify_search_coverage", { p_search: args.searchId }),
     ]);
+
+    // The grid invariant is READ from `searches.coverage_report`, never
+    // recomputed.
+    //
+    // This used to call `verify_search_coverage()` here, which looks like a
+    // read and is not: the function WRITES its verdict back to
+    // `searches.coverage_report`, and that trips the `updated_at` trigger. The
+    // consequences were real -- exporting mutated the row it was describing,
+    // and because `searches` is in the Realtime publication, every export
+    // nudged open browser tabs into a refresh. Generating a document must not
+    // be able to change the thing it documents.
+    //
+    // The runner already computes and stores this verdict on every tick, so the
+    // stored value is the one that describes the grid as it actually stands. A
+    // search that has never run has no verdict yet, and the Coverage sheet says
+    // so rather than inventing one.
+    const invariant =
+      search.coverage_report &&
+      typeof search.coverage_report === "object" &&
+      !Array.isArray(search.coverage_report)
+        ? (search.coverage_report as Record<string, unknown>)
+        : null;
 
     // The SAME pure function the search page renders and the tick logs, so the
     // workbook cannot disagree with the screen it was exported from.
@@ -184,7 +219,7 @@ export async function createSearchExport(
       createdAt: search.created_at,
       finishedAt: search.finished_at,
       generatedAt: new Date(),
-      invariant: (invariant as Record<string, unknown> | null) ?? null,
+      invariant,
     };
 
     const buffer = await buildWorkbook({ leads, coverage, meta });
