@@ -4,6 +4,14 @@ import type { Json } from "@/lib/database.types";
 import { getSupabaseAdminClient } from "@/server/db/admin";
 
 import { EmailEnrichmentService } from "./email-enrichment-service";
+import {
+  canAttempt,
+  clampBatch,
+  eligibleStatuses,
+  estimateMaxRequests,
+  MAX_ENRICHMENT_BATCH,
+  type EnrichmentMode,
+} from "./enrichment-policy";
 import { WebsiteEmailProvider } from "./providers/website-provider";
 import { domainOf, type FetchImpl } from "./providers/website-fetcher";
 import type { EmailStatus, EnrichmentInput, EnrichmentResult } from "./types";
@@ -31,11 +39,17 @@ import type { EmailStatus, EnrichmentInput, EnrichmentResult } from "./types";
 
 type AdminDb = ReturnType<typeof getSupabaseAdminClient>;
 
-/** The most leads one request may touch. Deliberately small. */
-export const MAX_ENRICHMENT_BATCH = 25;
-
 /** Gap between leads, on top of the provider's own per-host delay. */
 export const BETWEEN_LEADS_MS = 500;
+
+/** Re-exported so callers need one import for the whole enrichment contract. */
+export {
+  MAX_ATTEMPTS_PER_LEAD,
+  MAX_ENRICHMENT_BATCH,
+  REQUESTS_PER_LEAD,
+  estimateMaxRequests,
+  type EnrichmentMode,
+} from "./enrichment-policy";
 
 export class EnrichmentError extends Error {
   readonly status: number;
@@ -65,55 +79,148 @@ export type LeadEnrichmentOutcome = {
   durationMs: number;
 };
 
+/**
+ * What a batch WOULD do, shown before anything is requested.
+ *
+ * This is the shape the confirmation dialog is built from. A person approving a
+ * run should see the largest number it could reach, not an average.
+ */
+export type EnrichmentScope = {
+  mode: EnrichmentMode;
+  /** Leads matching the mode that still have attempts left. */
+  eligible: number;
+  /** How many of those this batch will take, after the cap. */
+  selected: number;
+  /** All of them have websites -- a lead without one is never selectable. */
+  withWebsite: number;
+  /** Worst case: robots.txt plus four pages, for every selected lead. */
+  maxExternalRequests: number;
+  provider: string;
+  /** Leads are processed one at a time, never in parallel. */
+  concurrency: number;
+  batchCap: number;
+  /** Eligible leads this batch will NOT reach. */
+  remaining: number;
+  /** Leads excluded, and why -- so a skipped lead is never silent. */
+  skipped: { leadId: string; name: string; reason: string }[];
+};
+
 export type EnrichmentRunResult = {
   dryRun: boolean;
+  mode: EnrichmentMode;
   /** Leads that had a usable website and were in scope for this run. */
   selected: number;
   processed: number;
   found: number;
   notFound: number;
   failed: number;
-  /** Leads with a website still awaiting a look after this run. */
+  /** Eligible leads still awaiting a look after this run. */
   remaining: number;
+  scope: EnrichmentScope;
   results: LeadEnrichmentOutcome[];
 };
 
+/** A lead row plus the two facts the policy needs to judge it. */
+type CandidateRow = EnrichmentCandidateLead & {
+  email_status: EmailStatus;
+};
+
 /**
- * Leads worth attempting: never enriched, and with a website.
+ * Leads this batch may attempt.
  *
- * `email_status = 'not_enriched'` is the filter that makes a re-run idempotent
- * — a lead that has been looked at, whatever the answer, is not looked at again
- * unless it is explicitly named.
+ * The MODE decides which `email_status` values are in play, and it is enforced
+ * in the query AND re-checked per lead by `canAttempt`. `leadIds` NARROWS that
+ * set; it never widens it. Naming a `found` lead in a retry batch selects
+ * nothing, because a mis-click must not be able to overwrite an address that
+ * was already discovered.
+ *
+ * Leads at the attempt cap are dropped here, which is what stops "retry failed"
+ * from being an endless loop a person can hold down.
  */
 async function selectCandidates(
   db: AdminDb,
-  args: { userId: string; searchId?: string; leadIds?: string[]; limit: number },
-): Promise<{ leads: EnrichmentCandidateLead[]; totalPending: number }> {
-  const base = () => {
-    let query = db
-      .from("leads")
-      .select("id, name, website, city, country", { count: "exact" })
-      .eq("user_id", args.userId)
-      .not("website", "is", null)
-      .neq("website", "");
+  args: {
+    userId: string;
+    mode: EnrichmentMode;
+    searchId?: string;
+    leadIds?: string[];
+    limit: number;
+  },
+): Promise<{
+  leads: EnrichmentCandidateLead[];
+  scope: Omit<EnrichmentScope, "provider" | "concurrency" | "batchCap" | "maxExternalRequests">;
+}> {
+  let query = db
+    .from("leads")
+    .select("id, name, website, city, country, email_status")
+    .eq("user_id", args.userId)
+    .not("website", "is", null)
+    .neq("website", "")
+    .in("email_status", eligibleStatuses(args.mode));
 
-    if (args.leadIds && args.leadIds.length > 0) {
-      query = query.in("id", args.leadIds);
-    } else {
-      query = query.eq("email_status", "not_enriched");
-    }
+  if (args.leadIds && args.leadIds.length > 0) query = query.in("id", args.leadIds);
+  if (args.searchId) query = query.eq("search_id", args.searchId);
 
-    if (args.searchId) query = query.eq("search_id", args.searchId);
-    return query;
-  };
-
-  const { data, count, error } = await base()
-    .order("created_at", { ascending: true })
-    .limit(args.limit);
-
+  const { data, error } = await query.order("created_at", { ascending: true });
   if (error) throw new Error(`Could not select leads for enrichment: ${error.message}`);
 
-  return { leads: (data ?? []) as EnrichmentCandidateLead[], totalPending: count ?? 0 };
+  const rows = (data ?? []) as CandidateRow[];
+
+  // Attempt history for exactly these leads, counted in memory. The set is
+  // bounded by the candidate pool, and Postgrest has no group-by worth the
+  // round trip here.
+  const attemptCounts = new Map<string, number>();
+  if (rows.length > 0) {
+    const { data: attempts } = await db
+      .from("lead_enrichment_attempts")
+      .select("lead_id")
+      .in(
+        "lead_id",
+        rows.map((r) => r.id),
+      );
+
+    for (const a of attempts ?? []) {
+      attemptCounts.set(a.lead_id, (attemptCounts.get(a.lead_id) ?? 0) + 1);
+    }
+  }
+
+  const eligible: EnrichmentCandidateLead[] = [];
+  const skipped: EnrichmentScope["skipped"] = [];
+
+  for (const row of rows) {
+    const decision = canAttempt({
+      mode: args.mode,
+      status: row.email_status,
+      website: row.website,
+      attemptCount: attemptCounts.get(row.id) ?? 0,
+    });
+
+    if (decision.eligible) {
+      eligible.push({
+        id: row.id,
+        name: row.name,
+        website: row.website,
+        city: row.city,
+        country: row.country,
+      });
+    } else {
+      skipped.push({ leadId: row.id, name: row.name, reason: decision.reason });
+    }
+  }
+
+  const selected = eligible.slice(0, args.limit);
+
+  return {
+    leads: selected,
+    scope: {
+      mode: args.mode,
+      eligible: eligible.length,
+      selected: selected.length,
+      withWebsite: selected.length,
+      remaining: Math.max(eligible.length - selected.length, 0),
+      skipped,
+    },
+  };
 }
 
 function toInput(lead: EnrichmentCandidateLead): EnrichmentInput {
@@ -201,6 +308,11 @@ async function persist(
 export async function runEnrichment(
   args: {
     userId: string;
+    /**
+     * `new` looks at leads never checked. `retry-failed` looks ONLY at leads
+     * whose last attempt failed, and cannot reach any other status.
+     */
+    mode?: EnrichmentMode;
     searchId?: string;
     leadIds?: string[];
     limit?: number;
@@ -214,24 +326,37 @@ export async function runEnrichment(
   },
   db: AdminDb = getSupabaseAdminClient(),
 ): Promise<EnrichmentRunResult> {
-  const limit = Math.min(Math.max(args.limit ?? 10, 1), MAX_ENRICHMENT_BATCH);
-  const { leads, totalPending } = await selectCandidates(db, {
+  const mode: EnrichmentMode = args.mode ?? "new";
+  const limit = clampBatch(args.limit);
+
+  const { leads, scope: partial } = await selectCandidates(db, {
     userId: args.userId,
+    mode,
     searchId: args.searchId,
     leadIds: args.leadIds,
     limit,
   });
 
+  const scope: EnrichmentScope = {
+    ...partial,
+    maxExternalRequests: estimateMaxRequests(leads.length),
+    provider: "website",
+    concurrency: 1,
+    batchCap: MAX_ENRICHMENT_BATCH,
+  };
+
   // ---- dry run: resolve the scope, touch nothing ------------------------
   if (args.dryRun) {
     return {
       dryRun: true,
+      mode,
       selected: leads.length,
       processed: 0,
       found: 0,
       notFound: 0,
       failed: 0,
-      remaining: Math.max(totalPending - leads.length, 0),
+      remaining: scope.remaining,
+      scope,
       results: leads.map((lead) => ({
         leadId: lead.id,
         name: lead.name,
@@ -285,12 +410,14 @@ export async function runEnrichment(
 
   return {
     dryRun: false,
+    mode,
     selected: leads.length,
     processed: results.length,
     found: results.filter((r) => r.status === "found" || r.status === "verified").length,
     notFound: results.filter((r) => r.status === "not_found").length,
     failed: results.filter((r) => r.status === "failed").length,
-    remaining: Math.max(totalPending - results.length, 0),
+    remaining: scope.remaining,
+    scope,
     results,
   };
 }

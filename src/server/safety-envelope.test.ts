@@ -12,7 +12,7 @@ import {
   RESULT_CEILING,
 } from "@/lib/constants";
 
-import { MAX_ENRICHMENT_BATCH } from "./enrichment/run-enrichment";
+import { MAX_ATTEMPTS_PER_LEAD, MAX_ENRICHMENT_BATCH } from "./enrichment/run-enrichment";
 import { EXTERNAL_PROVIDERS_ENABLED, PERSIST_RESOLVED_LOCATIONS } from "./geo/resolver-config";
 import { getPricingCatalog } from "./pricing/catalog.schema";
 import { classify, getSkuConfig, isVerified } from "./pricing/pricing-service";
@@ -276,9 +276,59 @@ describe("no email enrichment happens", () => {
 
     const runner = readCode(path.resolve(process.cwd(), "src/server/enrichment/run-enrichment.ts"));
     // Clamped on the server, so nothing the browser sends can widen it.
-    expect(runner).toMatch(
-      /Math\.min\(Math\.max\(args\.limit \?\? 10, 1\), MAX_ENRICHMENT_BATCH\)/,
+    expect(runner).toContain("clampBatch(args.limit)");
+
+    const policy = readCode(
+      path.resolve(process.cwd(), "src/server/enrichment/enrichment-policy.ts"),
     );
+    expect(policy).toMatch(
+      /Math\.min\(Math\.max\(Math\.trunc\(value\), 1\), MAX_ENRICHMENT_BATCH\)/,
+    );
+  });
+
+  it("bounds retrying so it cannot loop forever", () => {
+    // Nothing schedules enrichment, so the runaway case is a person holding a
+    // button down against a site that keeps refusing. The attempt cap is what
+    // makes that terminate, and it lives in selection, not in the UI.
+    expect(MAX_ATTEMPTS_PER_LEAD).toBe(3);
+
+    const policy = readCode(
+      path.resolve(process.cwd(), "src/server/enrichment/enrichment-policy.ts"),
+    );
+    expect(policy).toMatch(/args\.attemptCount >= MAX_ATTEMPTS_PER_LEAD/);
+
+    const runner = readCode(path.resolve(process.cwd(), "src/server/enrichment/run-enrichment.ts"));
+    // Every candidate is judged, named or not: passing an id is a request,
+    // never an override.
+    expect(runner).toContain("canAttempt(");
+    expect(runner).toMatch(/for \(const row of rows\)/);
+  });
+
+  it("keeps retry unable to reach a lead that is not failed", () => {
+    const policy = readCode(
+      path.resolve(process.cwd(), "src/server/enrichment/enrichment-policy.ts"),
+    );
+
+    // One list, one place. Retry must never widen beyond `failed`, or a second
+    // look could overwrite an address that was already discovered.
+    expect(policy).toMatch(/mode === "retry-failed" \? \["failed"\] : \["not_enriched"\]/);
+
+    const runner = readCode(path.resolve(process.cwd(), "src/server/enrichment/run-enrichment.ts"));
+    expect(runner).toContain('.in("email_status", eligibleStatuses(args.mode))');
+  });
+
+  it("never auto-triggers enrichment from a schedule, a tick or a search", () => {
+    // A cron job, a worker tick or a search completion calling this would make
+    // enrichment automatic, which is the one thing it must never be.
+    const callers = ALL_FILES.filter((file) => {
+      const relative = rel(file);
+      if (isTest(file)) return false;
+      if (relative === "src/app/api/enrichment/run/route.ts") return false;
+      if (relative.startsWith("src/server/enrichment/")) return false;
+      return /runEnrichment\s*\(/.test(readCode(file));
+    }).map(rel);
+
+    expect(callers).toEqual([]);
   });
 
   it("never claims an address was verified", () => {

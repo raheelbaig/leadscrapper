@@ -34,6 +34,16 @@ export const maxDuration = 300;
 
 const runEnrichmentSchema = z
   .object({
+    /**
+     * `new` (the default) looks only at leads never checked. `retry-failed`
+     * looks ONLY at leads whose last attempt failed — it cannot reach a lead
+     * that is `found`, so a retry can never overwrite a discovered address.
+     *
+     * Retrying is always explicit: nothing schedules it, and a lead that has
+     * already been attempted MAX_ATTEMPTS_PER_LEAD times is dropped from
+     * selection, so pressing the button repeatedly terminates.
+     */
+    mode: z.enum(["new", "retry-failed"]).default("new"),
     searchId: z.string().uuid().optional(),
     leadIds: z.array(z.string().uuid()).max(MAX_ENRICHMENT_BATCH).optional(),
     limit: z.coerce.number().int().min(1).max(MAX_ENRICHMENT_BATCH).optional(),
@@ -73,6 +83,7 @@ export async function POST(request: Request) {
   try {
     const result = await runEnrichment({
       userId: user.id,
+      mode: parsed.data.mode,
       searchId: parsed.data.searchId,
       leadIds: parsed.data.leadIds,
       limit: parsed.data.limit,

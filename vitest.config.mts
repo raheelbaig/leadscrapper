@@ -4,6 +4,20 @@ import { defineConfig } from "vitest/config";
 
 const root = process.cwd();
 
+/**
+ * The opt-in database suites all talk to ONE shared Supabase project.
+ *
+ * Run in parallel they interleave: one file snapshots `leads` and asserts it is
+ * unchanged while another is inserting its own fixtures into the same table.
+ * That produced a failure that vanished on re-run, which is the worst kind --
+ * it teaches you to press the button again instead of reading the result.
+ *
+ * So when the database suites are enabled, test FILES run one at a time. It
+ * costs a few seconds and buys a suite whose green means something. The
+ * hermetic run touches no shared state and keeps full parallelism.
+ */
+const DB_TESTS = process.env.LEAD_SCRAPPER_DB_TESTS === "1";
+
 export default defineConfig({
   test: {
     environment: "node",
@@ -14,6 +28,7 @@ export default defineConfig({
     // Phase 2 must make zero outbound requests. Any test that reaches the
     // network would hang rather than quietly succeed.
     testTimeout: 10_000,
+    fileParallelism: !DB_TESTS,
   },
   resolve: {
     alias: {
