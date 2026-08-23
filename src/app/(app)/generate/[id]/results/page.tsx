@@ -1,4 +1,4 @@
-import { CheckCircle2, Gauge, Mail, MailX, Percent, Users } from "lucide-react";
+import { CheckCircle2, Gauge, Mail, MailX, Percent, ShieldAlert, Users } from "lucide-react";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
@@ -21,6 +21,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { formatNumber, formatPercent } from "@/lib/format";
+import type { GenerationDisplayState } from "@/lib/generate/types";
 import { getCurrentUser, getSupabaseServerClient } from "@/server/db/server-client";
 import { GenerationNotFoundError, loadGenerationState } from "@/server/generate/state";
 
@@ -31,16 +32,21 @@ export const dynamic = "force-dynamic";
 /**
  * The centre of the product.
  *
- * Everything the generation produced, in one place, with the export as the
- * primary action. The user does not go to Leads to read the list, to Searches
- * to see coverage, to Enrichment to retry an address, or to Exports to get the
- * file.
+ * THE HEADING IS THE SERVER'S CONCLUSION, NOT THIS PAGE'S GUESS. `state.title`
+ * is computed in `describeRun` from coverage and email progress, which is what
+ * makes "Your leads are ready" impossible to render over an incomplete run. The
+ * previous build said "Your leads so far are ready" above a run that had
+ * searched 23% of its area and stopped at a call ceiling; that wording is gone,
+ * and the states that replace it each say what actually happened.
  *
- * COVERAGE IS THE COMPLETION CRITERION, AND THE PAGE SAYS SO. The lead target
- * appears as a minimum that was met or not met; it never appears as a progress
- * bar toward "done". A run that found 51 leads against a target of 20 while
- * searching 83% of its area is presented as 51 leads and 83% searched -- not as
- * a success with a footnote.
+ * COVERAGE IS PART OF COMPLETION. 117 leads against a target of 15 with 23% of
+ * the area searched is not a finished job, and nothing on this page presents it
+ * as one.
+ *
+ * Continuing a run is NOT here as a primary action. The generation drives
+ * itself to a real ending now, so a Continue button on the happy path would be
+ * asking the user to do the orchestrator's job. It survives only inside the
+ * Advanced disclosure, for a run that a safety limit genuinely halted.
  */
 export default async function GenerationResultsPage(props: PageProps<"/generate/[id]/results">) {
   const { id } = await props.params;
@@ -83,20 +89,27 @@ export default async function GenerationResultsPage(props: PageProps<"/generate/
     state: lead.state,
   }));
 
-  const finished = state.status === "completed";
-  const ceilingReached = state.stopReason === "generation_call_ceiling";
-  const enrichmentSkipped = state.stopReason === "enrichment_not_consented";
-
   return (
     <>
       <PageHeader
-        title={finished ? "Your leads are ready" : "Your leads so far are ready"}
+        title={state.title}
         description={`${state.niche} · ${state.locationLabel}`}
         actions={
           <Button variant="outline" size="sm" render={<Link href="/generate" />}>
             Generate more leads
           </Button>
         }
+      />
+
+      <OutcomeBanner
+        displayState={state.displayState}
+        blockedReason={state.blockedReason}
+        callsUsed={state.budget.used}
+        callBudget={state.budget.searchCallBudget}
+        areasRemaining={state.search.areasRemaining}
+        areaOwedKm2={state.search.areaOwedKm2}
+        coveragePct={state.search.coveragePct}
+        leadsFound={state.search.leadsFound}
       />
 
       {/* ---- Headline figures ---- */}
@@ -130,7 +143,7 @@ export default async function GenerationResultsPage(props: PageProps<"/generate/
           tone={state.search.fullyCovered ? "positive" : "warning"}
         />
         <StatCard
-          label="No email on the site"
+          label="No public email"
           value={formatNumber(state.enrichment.notFound)}
           sublabel="checked, but no address published"
           icon={MailX}
@@ -138,13 +151,13 @@ export default async function GenerationResultsPage(props: PageProps<"/generate/
         <StatCard
           label="Could not be checked"
           value={formatNumber(state.enrichment.failed)}
-          sublabel="the site blocked or did not answer"
+          sublabel="the site blocked us or did not answer"
           icon={MailX}
           tone={state.enrichment.failed > 0 ? "warning" : undefined}
         />
         <StatCard
           label="Google requests used"
-          value={`${formatNumber(state.budget.used)} / ${formatNumber(state.budget.ceiling)}`}
+          value={formatNumber(state.budget.used)}
           sublabel={`${formatNumber(state.budget.quotaRemaining)} left in this month's protected allowance`}
           icon={Gauge}
         />
@@ -154,8 +167,12 @@ export default async function GenerationResultsPage(props: PageProps<"/generate/
       <Card>
         <CardContent className="flex flex-wrap items-center gap-x-8 gap-y-2 pt-6 text-sm">
           <span className="flex items-center gap-2">
-            <CheckCircle2 className="size-4 text-emerald-600 dark:text-emerald-400" />
-            <span className="text-muted-foreground">Completed in</span>
+            {state.lifecycleComplete ? (
+              <CheckCircle2 className="size-4 text-emerald-600 dark:text-emerald-400" />
+            ) : null}
+            <span className="text-muted-foreground">
+              {state.lifecycleComplete ? "Completed in" : "Ran for"}
+            </span>
             <ElapsedTimer
               startedAt={state.createdAt}
               endedAt={state.completedAt}
@@ -177,57 +194,9 @@ export default async function GenerationResultsPage(props: PageProps<"/generate/
         </CardContent>
       </Card>
 
-      {/* ---- Why it stopped, when it is not simply finished ---- */}
-      {ceilingReached ? (
-        <Card className="border-amber-500/40 bg-amber-500/5">
-          <CardContent className="space-y-1 pt-6">
-            <p className="text-sm font-medium text-amber-700 dark:text-amber-400">
-              This generation reached its current safety limit.
-            </p>
-            <p className="text-muted-foreground text-xs">
-              {formatNumber(state.budget.used)} of {formatNumber(state.budget.ceiling)} Google
-              requests were used, and {formatNumber(state.search.areasRemaining)} section(s) —{" "}
-              {state.search.areaOwedKm2.toFixed(1)} km² — have not been searched. Continuing starts
-              a new approval for another {formatNumber(state.budget.ceiling)} requests. Nothing
-              continues without you.
-            </p>
-          </CardContent>
-        </Card>
-      ) : null}
-
-      {enrichmentSkipped ? (
-        <Card>
-          <CardContent className="space-y-1 pt-6">
-            <p className="text-sm font-medium">Email discovery is available.</p>
-            <p className="text-muted-foreground text-xs">
-              This generation collected businesses only. Starting email discovery will visit the{" "}
-              {formatNumber(state.enrichment.remaining)} business website(s) that have not been
-              checked yet.
-            </p>
-          </CardContent>
-        </Card>
-      ) : null}
-
-      {/* ---- Actions ---- */}
-      <div className="flex flex-wrap gap-3">
+      {/* ---- Actions. Export is the primary one. ---- */}
+      <div className="flex flex-wrap items-center gap-3">
         <ExportExcelButton searchId={state.searchId} leadCount={leads.length} />
-
-        {state.search.areasRemaining > 0 ? (
-          <ContinueGenerationButton
-            searchId={state.searchId}
-            label={ceilingReached ? "Continue generation" : "Continue searching"}
-            areasRemaining={state.search.areasRemaining}
-          />
-        ) : null}
-
-        {state.enrichment.remaining > 0 ? (
-          <ContinueGenerationButton
-            searchId={state.searchId}
-            label="Find emails"
-            icon="mail"
-            enrichEmails
-          />
-        ) : null}
 
         {state.enrichment.failed > 0 ? (
           <RetryFailedEmailsButton
@@ -235,9 +204,13 @@ export default async function GenerationResultsPage(props: PageProps<"/generate/
             failedCount={state.enrichment.failed}
           />
         ) : null}
+
+        <Button variant="ghost" size="lg" render={<Link href={`/searches/${state.searchId}`} />}>
+          View search details
+        </Button>
       </div>
 
-      {/* ---- Coverage explanation ---- */}
+      {/* ---- Coverage ---- */}
       <Card>
         <CardHeader>
           <CardTitle className="text-sm">Coverage</CardTitle>
@@ -264,7 +237,11 @@ export default async function GenerationResultsPage(props: PageProps<"/generate/
             </span>
           </div>
 
-          {!state.search.fullyCovered ? (
+          {state.search.fullyCovered ? (
+            <p className="text-muted-foreground text-sm">
+              Every section of the selected area was searched.
+            </p>
+          ) : (
             <Accordion>
               <AccordionItem value="why">
                 <AccordionTrigger className="text-sm">
@@ -273,14 +250,14 @@ export default async function GenerationResultsPage(props: PageProps<"/generate/
                 <AccordionContent className="text-muted-foreground space-y-2 text-sm">
                   <p>
                     Your area is divided into sections and each one is searched separately, so we
-                    always know exactly which parts have been looked at. This run stopped before
-                    reaching every section — usually because it reached the number of Google
-                    requests you approved.
+                    always know exactly which parts have been looked at. This generation ended
+                    before reaching every section — usually because it reached the limit on how many
+                    Google requests one search may make.
                   </p>
                   <p>
                     Nothing was skipped silently. {formatNumber(state.search.areasRemaining)}{" "}
-                    section(s) covering {state.search.areaOwedKm2.toFixed(1)} km² are still owed,
-                    and Continue searching picks up exactly there.
+                    section(s) covering {state.search.areaOwedKm2.toFixed(1)} km² are still owed and
+                    still recorded.
                   </p>
                   <p>
                     Finding more leads than you asked for does not end a search. The target is a
@@ -289,10 +266,6 @@ export default async function GenerationResultsPage(props: PageProps<"/generate/
                 </AccordionContent>
               </AccordionItem>
             </Accordion>
-          ) : (
-            <p className="text-muted-foreground text-sm">
-              Every section of the selected area was searched.
-            </p>
           )}
         </CardContent>
       </Card>
@@ -307,13 +280,151 @@ export default async function GenerationResultsPage(props: PageProps<"/generate/
         </CardContent>
       </Card>
 
-      <p className="text-muted-foreground text-xs">
-        Need the finer detail? The{" "}
-        <Link href={`/searches/${state.searchId}`} className="underline">
-          search view
-        </Link>{" "}
-        has the coverage map, the section-by-section table and the full activity log.
-      </p>
+      {/* ---- Advanced. Continuing lives here, not on the happy path. ---- */}
+      <Accordion>
+        <AccordionItem value="advanced">
+          <AccordionTrigger className="text-muted-foreground text-xs">
+            Advanced controls
+          </AccordionTrigger>
+          <AccordionContent className="space-y-4 pt-2">
+            <p className="text-muted-foreground text-xs">
+              A generation drives itself to an ending, so these are recovery actions rather than
+              steps in the normal flow.
+            </p>
+
+            <div className="flex flex-wrap gap-3">
+              {state.search.areasRemaining > 0 ? (
+                <ContinueGenerationButton
+                  searchId={state.searchId}
+                  label="Search the remaining area"
+                  areasRemaining={state.search.areasRemaining}
+                />
+              ) : null}
+
+              {state.enrichment.remaining > 0 ? (
+                <ContinueGenerationButton
+                  searchId={state.searchId}
+                  label="Find emails for the remaining businesses"
+                  icon="mail"
+                  enrichEmails
+                />
+              ) : null}
+            </div>
+
+            <p className="text-muted-foreground text-xs">
+              Full detail — the coverage map, the section-by-section table and the activity log — is
+              on the{" "}
+              <Link href={`/searches/${state.searchId}`} className="underline">
+                search page
+              </Link>
+              . Every workbook you have generated is under{" "}
+              <Link href="/exports" className="underline">
+                Exports
+              </Link>
+              .
+            </p>
+          </AccordionContent>
+        </AccordionItem>
+      </Accordion>
     </>
+  );
+}
+
+/**
+ * One honest sentence about how the generation ended.
+ *
+ * Rendered from the SERVER's display state, so the banner and the page heading
+ * cannot disagree about whether the job is finished.
+ */
+function OutcomeBanner({
+  displayState,
+  blockedReason,
+  callsUsed,
+  callBudget,
+  areasRemaining,
+  areaOwedKm2,
+  coveragePct,
+  leadsFound,
+}: {
+  displayState: GenerationDisplayState;
+  blockedReason: string | null;
+  callsUsed: number;
+  callBudget: number;
+  areasRemaining: number;
+  areaOwedKm2: number;
+  coveragePct: number;
+  leadsFound: number;
+}) {
+  if (displayState === "ready") return null;
+
+  if (displayState === "paused-for-safety") {
+    return (
+      <Card className="border-amber-500/40 bg-amber-500/5">
+        <CardContent className="space-y-2 pt-6">
+          <p className="flex items-center gap-2 text-sm font-medium text-amber-700 dark:text-amber-400">
+            <ShieldAlert className="size-4" />
+            Generation paused for safety
+          </p>
+          <p className="text-muted-foreground text-xs">
+            {blockedReason ??
+              "Your search safety limit was reached before the selected area was fully searched."}
+          </p>
+          <ul className="text-muted-foreground grid gap-1 text-xs sm:grid-cols-2">
+            <li>
+              Leads found:{" "}
+              <span className="text-foreground font-medium">{formatNumber(leadsFound)}</span>
+            </li>
+            <li>
+              Area searched:{" "}
+              <span className="text-foreground font-medium">{formatPercent(coveragePct, 1)}</span>
+            </li>
+            <li>
+              Google requests used:{" "}
+              <span className="text-foreground font-medium">
+                {formatNumber(callsUsed)} of {formatNumber(callBudget)}
+              </span>
+            </li>
+            <li>
+              Area not searched:{" "}
+              <span className="text-foreground font-medium">
+                {formatNumber(areasRemaining)} section(s), {areaOwedKm2.toFixed(1)} km²
+              </span>
+            </li>
+          </ul>
+          <p className="text-muted-foreground text-xs">
+            No paid usage was entered and nothing was requested beyond the limit. Everything
+            collected so far is below and can be exported.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (displayState === "failed") {
+    return (
+      <Card className="border-red-500/40 bg-red-500/5">
+        <CardContent className="space-y-1 pt-6">
+          <p className="text-sm font-medium text-red-700 dark:text-red-400">
+            This generation could not be finished
+          </p>
+          <p className="text-muted-foreground text-xs">
+            {blockedReason ?? "Something went wrong and the generation could not continue."}{" "}
+            Everything collected before it stopped is below.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <Card>
+      <CardContent className="space-y-1 pt-6">
+        <p className="text-sm font-medium">Generation stopped</p>
+        <p className="text-muted-foreground text-xs">
+          {blockedReason ?? "You stopped this generation."} Everything collected before it stopped
+          is below and can be exported.
+        </p>
+      </CardContent>
+    </Card>
   );
 }

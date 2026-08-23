@@ -339,7 +339,17 @@ async function advanceSearchPhase(
 
   // Re-read rather than reuse: the tick just wrote `search_started_at` through
   // a different path, and the state below must describe the row as it now is.
-  const refreshed = await loadRun(db, { runId: run.id, userId: run.user_id });
+  let refreshed = await loadRun(db, { runId: run.id, userId: run.user_id });
+
+  // THE LIVENESS GUARD.
+  //
+  // A slice that completed no area and spent no call changed nothing, and
+  // repeating it will change nothing either. Counting those is what stops a
+  // self-advancing run from asking forever; any real progress resets it.
+  const madeProgress = tick.apiCalls > 0 || tick.tiles.length > 0;
+  const stalled = await trackProgress(db, refreshed, madeProgress, now);
+  if (stalled) return buildGenerationState(db, stalled, now);
+  refreshed = await loadRun(db, { runId: run.id, userId: run.user_id });
 
   // Coverage complete is the ONLY ending that hands over to email discovery.
   // Every other stop leaves geography owed, and beginning to fetch other
@@ -395,6 +405,51 @@ async function advanceSearchPhase(
  * Returns the updated row when it stopped the run, or null when there is room
  * to continue.
  */
+/**
+ * Counts consecutive advances that changed nothing, and halts once too many
+ * have passed.
+ *
+ * Bounded rather than infinite because the orchestrator now drives itself. The
+ * counter lives on the run row because the decision spans advances -- each one
+ * is a separate request and has no memory of the last.
+ *
+ * Returns the halted row, or null when the run may continue.
+ */
+async function trackProgress(
+  db: AdminDb,
+  run: GenerationRunRow,
+  madeProgress: boolean,
+  now: () => number,
+): Promise<GenerationRunRow | null> {
+  if (madeProgress) {
+    if (run.no_progress_ticks !== 0) await patchRun(db, run.id, { no_progress_ticks: 0 });
+    return null;
+  }
+
+  const attempts = run.no_progress_ticks + 1;
+  if (attempts < GENERATION_LIMITS.maxNoProgressAdvances) {
+    await patchRun(db, run.id, { no_progress_ticks: attempts });
+    return null;
+  }
+
+  const halted = await finishRun(db, run, "no_progress", now, {
+    status: "stopped",
+    lastError: `The generation made no progress across ${attempts} consecutive attempts.`,
+  });
+
+  await logSearchEvent(db, {
+    searchId: run.search_id,
+    level: "error",
+    code: "generation_no_progress",
+    message:
+      `Generation halted after ${attempts} consecutive slices that completed no area and spent ` +
+      `no Google call. Stopping is safer than continuing to ask.`,
+    meta: { generation_run_id: run.id, attempts, api_calls_made: 0 },
+  });
+
+  return halted;
+}
+
 async function stopIfCeilingReached(
   db: AdminDb,
   run: GenerationRunRow,
@@ -409,16 +464,16 @@ async function stopIfCeilingReached(
 
   if (areasAllowedThisAdvance(remaining) > 0) return null;
 
-  const stopped = await finishRun(db, run, "generation_call_ceiling", now, { status: "stopped" });
+  const stopped = await finishRun(db, run, "safety_limit_reached", now, { status: "stopped" });
 
   await logSearchEvent(db, {
     searchId: run.search_id,
     level: "warn",
-    code: "generation_ceiling_reached",
+    code: "generation_safety_limit",
     message:
-      `Generation stopped at its approval ceiling: ${used} of ${run.call_ceiling} Google call(s) ` +
+      `Generation paused for safety: ${used} of ${run.call_ceiling} permitted Google call(s) ` +
       `used, ${remaining} left — fewer than the ${GENERATION_LIMITS.worstCaseCallsPerArea} one ` +
-      `more area could cost. Continuing requires a new approval.`,
+      `more area could cost. The remaining area is still owed and still recorded.`,
     meta: {
       generation_run_id: run.id,
       calls_used: used,
@@ -431,19 +486,36 @@ async function stopIfCeilingReached(
 }
 
 /**
- * How a tick's ending maps onto the approval's ending.
+ * How a tick's ending maps onto the LIFECYCLE's ending.
  *
- * Absent from this table -- deliberately -- are `tile_budget_reached` and
- * `tick_slice_expired`, which are not endings at all: they are the tick runner
- * releasing its lease so another slice can continue. Mapping them to a stop
- * would turn every long search into a stalled one.
+ * ABSENT FROM THIS TABLE IS EVERY ENDING THAT IS NOT ONE. A slice that hit its
+ * tile cap, ran out of wall clock, lost a race for the lease, or failed a
+ * single area is not a finished generation -- it is the loop. Mapping any of
+ * those to a stop is what made the previous build ask the user to press
+ * "Continue" three times for one city.
+ *
+ * Specifically NOT terminal, and the reasoning for each:
+ *
+ *   tile_budget_reached  - the slice filled up. More slices follow.
+ *   tick_slice_expired   - the slice ran out of time. More slices follow.
+ *   tile_error           - the tile returns to pending and is retried by the
+ *                          next slice. Every retry is a real billable request,
+ *                          so the per-search budget bounds this; a tile that
+ *                          fails without spending is caught by the no-progress
+ *                          guard instead.
+ *   lease_lost           - another runner holds it. Transient by nature, and
+ *                          the no-progress guard bounds it if it is not.
+ *
+ * What IS terminal is only the money running out, the user stopping, or Google
+ * refusing in a way that will not fix itself.
  */
 const SEARCH_STOP_TO_GENERATION: Partial<Record<string, GenerationStopReason>> = {
-  call_budget_reached: "search_paused",
-  quota_exhausted: "search_paused",
-  tile_error: "search_paused",
-  lease_lost: "search_paused",
-  stopped_at_target: "search_paused",
+  // The two hard spending limits. Not failures -- the guard did its job.
+  call_budget_reached: "safety_limit_reached",
+  quota_exhausted: "safety_limit_reached",
+  // Only reachable by a search created before the target stopped being a
+  // termination condition. Its frozen policy is honoured rather than rewritten.
+  stopped_at_target: "safety_limit_reached",
   paused_by_user: "stopped_by_user",
   canceled: "stopped_by_user",
   fatal_api_error: "failed",
@@ -472,23 +544,42 @@ async function advanceEnrichmentPhase(
     await patchRun(db, run.id, { enrichment_started_at: nowIso(now) });
   }
 
-  const result = await runEnrichment({
-    userId: run.user_id,
-    // "new" only: this batch can reach a lead that has never been looked at and
-    // nothing else. A `found` address can never be overwritten by the guided
-    // flow, and a `failed` lead is retried only by an explicit press.
-    mode: "new",
-    searchId: run.search_id,
-    limit: GENERATION_LIMITS.enrichmentLeadsPerAdvance,
-    // A LIVE run, which is what the user consented to. `runEnrichment` refuses
-    // a live run without an explicit fetch implementation, so this cannot
-    // silently fall back to a network-capable default.
-    dryRun: false,
-    fetchImpl: deps.enrichmentFetch ?? globalThis.fetch,
-  });
+  let result;
+  try {
+    result = await runEnrichment({
+      userId: run.user_id,
+      // "new" ONLY, and this is a deliberate reading of the brief.
+      //
+      // The batch can reach a lead that has never been looked at and nothing
+      // else. A `found` address can never be overwritten, and a lead whose site
+      // already refused us is NOT retried automatically -- "do not repeatedly
+      // hammer failed websites" and an automatic retry loop are the same thing
+      // seen from the small business's server log. Retrying stays an explicit
+      // press on the results page, still capped at MAX_ATTEMPTS_PER_LEAD.
+      //
+      // This is also what makes the loop terminate: a processed lead leaves
+      // `not_enriched` whatever the outcome, so the eligible set only shrinks.
+      mode: "new",
+      searchId: run.search_id,
+      limit: GENERATION_LIMITS.enrichmentLeadsPerAdvance,
+      // A LIVE run, which is what the user consented to. `runEnrichment` refuses
+      // a live run without an explicit fetch implementation, so this cannot
+      // silently fall back to a network-capable default.
+      dryRun: false,
+      fetchImpl: deps.enrichmentFetch ?? globalThis.fetch,
+    });
+  } catch (error) {
+    // A batch that throws must end the run rather than be retried forever by
+    // the self-advancing loop.
+    return handleAdvanceError(db, run, error, now);
+  }
 
   const refreshed = await loadRun(db, { runId: run.id, userId: run.user_id });
 
+  // COMPLETION IS CHECKED FIRST, before the liveness guard. The batch that
+  // finishes the job is very often an empty one -- nothing left to select,
+  // nothing processed -- and testing for a stall before testing for completion
+  // would score the successful ending as a failure to progress.
   if (result.remaining === 0) {
     const finished = await finishRun(db, refreshed, "generation_complete", now, {
       status: "completed",
@@ -497,6 +588,11 @@ async function advanceEnrichmentPhase(
     });
     return buildGenerationState(db, finished, now);
   }
+
+  // The same liveness guard the search phase uses. Leads remain eligible but
+  // this batch processed none of them, and repeating it cannot change that.
+  const stalled = await trackProgress(db, refreshed, result.processed > 0, now);
+  if (stalled) return buildGenerationState(db, stalled, now);
 
   return buildGenerationState(db, refreshed, now);
 }
@@ -563,9 +659,12 @@ async function handleAdvanceError(
   }
 
   // Another runner holds the lease. Transient by nature, so the run stays
-  // running and the client simply asks again.
+  // running and the client simply asks again -- but it counts as an advance
+  // that changed nothing, so a lease that never frees up ends the run through
+  // the liveness guard instead of being retried forever.
   if (error instanceof ClaimError) {
-    return buildGenerationState(db, run, now);
+    const stalled = await trackProgress(db, run, false, now);
+    return buildGenerationState(db, stalled ?? run, now);
   }
 
   const message = error instanceof Error ? error.message : String(error);

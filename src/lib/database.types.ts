@@ -285,6 +285,7 @@ export type Database = {
           enrichment_started_at: string | null
           id: string
           last_error: string | null
+          no_progress_ticks: number
           phase: Database["public"]["Enums"]["generation_phase"]
           search_completed_at: string | null
           search_id: string
@@ -304,6 +305,7 @@ export type Database = {
           enrichment_started_at?: string | null
           id?: string
           last_error?: string | null
+          no_progress_ticks?: number
           phase?: Database["public"]["Enums"]["generation_phase"]
           search_completed_at?: string | null
           search_id: string
@@ -323,6 +325,7 @@ export type Database = {
           enrichment_started_at?: string | null
           id?: string
           last_error?: string | null
+          no_progress_ticks?: number
           phase?: Database["public"]["Enums"]["generation_phase"]
           search_completed_at?: string | null
           search_id?: string

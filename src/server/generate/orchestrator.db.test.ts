@@ -4,6 +4,7 @@ import { buildCoverageReport, type CoverageTile } from "@/lib/coverage-report";
 import type { TileState } from "@/lib/tile-states";
 import type { EnrichmentRunResult } from "@/server/enrichment/run-enrichment";
 import type { ControlledTickResult } from "@/server/search/run-controlled-tick";
+import { SEARCH_LIMITS } from "@/server/search/limits";
 
 import { GENERATION_LIMITS } from "./limits";
 
@@ -77,9 +78,30 @@ describe.skipIf(!ENABLED)("guided generation orchestration", () => {
   });
 
   afterAll(async () => {
-    // Order matters: leads and tiles hang off the search, and generation runs
-    // cascade with it.
-    for (const searchId of createdSearchIds) {
+    // SWEPT BY MARKER, not only by the ids this run collected.
+    //
+    // `createGenerationRun` can throw AFTER `createSearch` has already written
+    // its row -- a failed tile insert deliberately leaves the search behind so
+    // the incomplete grid is visible rather than silently discarded. When that
+    // happened, the id was never pushed onto `createdSearchIds` and the fixture
+    // survived the suite. It really did: two "Guided Fixture" searches were
+    // found in the shared project afterwards.
+    //
+    // So cleanup keys off the fixture marker instead. `city = 'Fixtureville'`
+    // and a `Guided Fixture` niche cannot match anything real, which makes this
+    // safe to run unconditionally and makes a partial failure self-healing.
+    const { data: strays } = await db
+      .from("searches")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("city", "Fixtureville")
+      .like("niche", "Guided Fixture%");
+
+    const ids = new Set([...createdSearchIds, ...(strays ?? []).map((row) => row.id)]);
+
+    // Order matters: leads hang off the search, and generation runs cascade
+    // with it.
+    for (const searchId of ids) {
       await db.from("leads").delete().eq("search_id", searchId);
       await db.from("generation_runs").delete().eq("search_id", searchId);
       await db.from("searches").delete().eq("id", searchId);
@@ -386,8 +408,11 @@ describe.skipIf(!ENABLED)("guided generation orchestration", () => {
       { runTick: makeTickFake({ asked }), runEnrichment: makeEnrichmentFake({ calls: 0 }) },
     );
 
-    // floor(30 / 9) = 3. Never the tick runner's own cap of 12.
-    expect(asked[0]).toBe(3);
+    // floor(150 / 9) = 16, clamped to the tick runner's own cap of 12. Under the
+    // 30-call gate this was 3, which is what made a real city take several
+    // presses to finish. The clamp is what still keeps a slice bounded.
+    expect(asked[0]).toBe(12);
+    expect(asked[0]).toBeLessThanOrEqual(SEARCH_LIMITS.maxTilesPerTick);
   });
 
   it("walks searching -> finding emails -> ready and completes", async () => {
@@ -402,6 +427,12 @@ describe.skipIf(!ENABLED)("guided generation orchestration", () => {
 
     const phases: string[] = [];
     let state = await stateModule.loadGenerationState({ runId: created.runId, userId });
+
+    // The phase BEFORE each advance as well as after it. A slice may now cover
+    // a small grid in one go, so `searching` can be true only on the way in --
+    // recording just the outcomes would miss it and, worse, would look like the
+    // search phase had been skipped.
+    phases.push(state.phase);
 
     for (let i = 0; i < 30 && state.status === "running" && state.canAdvance; i += 1) {
       state = await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
@@ -443,7 +474,15 @@ describe.skipIf(!ENABLED)("guided generation orchestration", () => {
    * geography is covered. The run must stop having spent AT MOST what the user
    * approved -- not approximately, and never one call more.
    */
-  it("never exceeds the approved call ceiling, even when every area costs its worst case", async () => {
+  /**
+   * THE HARD LIMIT, WITHOUT A GATE IN FRONT OF IT.
+   *
+   * Every area here costs its worst case, so the per-search spending limit binds
+   * long before the geography is covered. The run must stop having spent AT MOST
+   * what the limit allows -- not approximately, and never one call more -- and
+   * it must say "paused for safety" rather than inviting the user to continue.
+   */
+  it("never exceeds the hard call limit, even when every area costs its worst case", async () => {
     const created = await createRun({ enrichEmails: true, testBbox: LARGE_BOX });
     const asked: number[] = [];
 
@@ -454,26 +493,273 @@ describe.skipIf(!ENABLED)("guided generation orchestration", () => {
 
     let state = await stateModule.loadGenerationState({ runId: created.runId, userId });
 
-    for (let i = 0; i < 20 && state.status === "running" && state.canAdvance; i += 1) {
+    for (let i = 0; i < 40 && state.status === "running" && state.canAdvance; i += 1) {
       state = await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
       // Checked after EVERY advance, not only at the end.
       expect(state.budget.used).toBeLessThanOrEqual(GENERATION_LIMITS.maxGoogleCallsPerRun);
+      expect(state.budget.used).toBeLessThanOrEqual(SEARCH_LIMITS.maxCallsPerSearch);
     }
 
     expect(state.status).toBe("stopped");
-    expect(state.stopReason).toBe("generation_call_ceiling");
-    expect(state.budget.used).toBeLessThanOrEqual(GENERATION_LIMITS.maxGoogleCallsPerRun);
+    expect(state.stopReason).toBe("safety_limit_reached");
+    expect(state.budget.used).toBeLessThanOrEqual(SEARCH_LIMITS.maxCallsPerSearch);
+
+    // Honest wording, and the figures the user needs to understand it.
+    expect(state.displayState).toBe("paused-for-safety");
+    expect(state.title).toBe("Generation paused for safety");
+    expect(state.lifecycleComplete).toBe(false);
 
     // It stopped with area still owed, and says so rather than claiming to be
     // finished.
     expect(state.search.fullyCovered).toBe(false);
     expect(state.search.areasRemaining).toBeGreaterThan(0);
 
-    // A further advance is refused: the approval is spent.
+    // A further advance is refused: the limit is the limit.
     const usedAtStop = state.budget.used;
     const after = await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
     expect(after.budget.used).toBe(usedAtStop);
     expect(after.status).toBe("stopped");
+  });
+
+  /**
+   * NO MANUAL CONTINUE IN THE NORMAL FLOW.
+   *
+   * The point of the redesign: one approval, and the orchestrator walks the
+   * whole lifecycle by itself. Nothing here creates a second approval, and the
+   * run still reaches a finished state.
+   */
+  it("drives the whole lifecycle from a single approval", async () => {
+    const created = await createRun({ enrichEmails: true });
+    const asked: number[] = [];
+    const enrichmentCounter = { calls: 0 };
+    const deps = {
+      runTick: makeTickFake({ asked }),
+      runEnrichment: makeEnrichmentFake(enrichmentCounter),
+    };
+
+    let state = await stateModule.loadGenerationState({ runId: created.runId, userId });
+    let advances = 0;
+
+    while (state.status === "running" && state.canAdvance && advances < 40) {
+      state = await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
+      advances += 1;
+    }
+
+    expect(state.lifecycleComplete).toBe(true);
+    expect(state.title).toBe("Your leads are ready");
+
+    // Exactly ONE approval existed for the whole job.
+    const { count } = await db
+      .from("generation_runs")
+      .select("id", { count: "exact", head: true })
+      .eq("search_id", created.searchId);
+    expect(count).toBe(1);
+
+    // It really did both halves of the work by itself.
+    expect(asked.length).toBeGreaterThan(0);
+    expect(enrichmentCounter.calls).toBeGreaterThan(0);
+  });
+
+  /**
+   * THE LIVENESS GUARD.
+   *
+   * A self-advancing run must not ask forever. A tick that completes no area
+   * and spends nothing is repeated only so many times before the run halts.
+   */
+  it("halts a run that stops making progress instead of asking forever", async () => {
+    const created = await createRun({ enrichEmails: false, testBbox: LARGE_BOX });
+
+    // A tick that does nothing at all: no tiles, no calls, nothing inserted.
+    const inertTick = (async () => ({
+      outcome: "paused-tile-limit",
+      searchId: created.searchId,
+      searchStatus: "running",
+      stopReason: "tile_budget_reached",
+      tiles: [],
+      apiCalls: 0,
+      apiCallsTotal: 0,
+      callBudget: 150,
+      resultsReceived: 0,
+      leadsInserted: 0,
+      duplicatesRejected: 0,
+      placesRejected: 0,
+      leadsFound: 0,
+      targetLeads: 40,
+      targetReached: false,
+      preflight: null as never,
+      coverage: { tilesRemaining: 99 } as never,
+      error: null,
+    })) as unknown as typeof import("@/server/search/run-controlled-tick").runControlledTick;
+
+    const deps = { runTick: inertTick, runEnrichment: makeEnrichmentFake({ calls: 0 }) };
+
+    let state = await stateModule.loadGenerationState({ runId: created.runId, userId });
+    let advances = 0;
+
+    while (state.status === "running" && state.canAdvance && advances < 50) {
+      state = await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
+      advances += 1;
+    }
+
+    expect(state.status).toBe("stopped");
+    expect(state.stopReason).toBe("no_progress");
+    // It gave up promptly rather than grinding.
+    expect(advances).toBeLessThanOrEqual(GENERATION_LIMITS.maxNoProgressAdvances + 1);
+    // And it spent nothing doing so.
+    expect(state.budget.used).toBe(0);
+  });
+
+  /**
+   * NAVIGATING AWAY MUST NOT LOSE THE GENERATION.
+   *
+   * The dashboard finds the open run with exactly this query. Nothing about the
+   * run lives in the browser, so the card can be rebuilt on any device.
+   */
+  it("leaves an active generation discoverable for the dashboard", async () => {
+    const created = await createRun({ enrichEmails: true });
+
+    const { data: active } = await db
+      .from("generation_runs")
+      .select("id, search_id, phase, created_at, searches!inner(niche, label)")
+      .eq("status", "running")
+      .eq("search_id", created.searchId)
+      .maybeSingle();
+
+    expect(active).not.toBeNull();
+    expect(active!.id).toBe(created.runId);
+    // The card needs the niche and location, and gets them from the search.
+    expect((active as unknown as { searches: { niche: string } }).searches.niche).toContain(
+      "Guided Fixture",
+    );
+
+    // And the full state rebuilds from persisted data alone.
+    const rebuilt = await stateModule.loadGenerationState({ runId: created.runId, userId });
+    expect(rebuilt.runId).toBe(created.runId);
+    expect(rebuilt.status).toBe("running");
+  });
+
+  /**
+   * DO NOT REPEATEDLY HAMMER FAILED WEBSITES.
+   *
+   * The automatic flow runs `new` mode only, so a site that already refused us
+   * is never retried as a side effect of the lifecycle continuing. Retrying is
+   * an explicit press, and is still capped at MAX_ATTEMPTS_PER_LEAD underneath.
+   */
+  it("never re-attempts a lead whose website already failed", async () => {
+    const created = await createRun({ enrichEmails: true });
+    const seenLeadIds: string[][] = [];
+
+    const recordingEnrichment = (async (args: {
+      userId: string;
+      searchId?: string;
+      limit?: number;
+    }) => {
+      const { data: candidates } = await db
+        .from("leads")
+        .select("id")
+        .eq("search_id", args.searchId!)
+        .eq("email_status", "not_enriched")
+        .not("website", "is", null)
+        .neq("website", "")
+        .order("created_at")
+        .limit(args.limit ?? 5);
+
+      const ids = (candidates ?? []).map((lead) => lead.id);
+      seenLeadIds.push(ids);
+
+      // Every one of them fails, the way a bot-blocking host would.
+      for (const id of ids) {
+        await db
+          .from("leads")
+          .update({ email_status: "failed", email_checked_at: new Date().toISOString() })
+          .eq("id", id);
+        await db.from("lead_enrichment_attempts").insert({
+          user_id: args.userId,
+          lead_id: id,
+          provider: "fake",
+          status: "failed",
+          duration_ms: 3_600,
+          cost_units: 0,
+          raw: {},
+        });
+      }
+
+      const { count: remaining } = await db
+        .from("leads")
+        .select("id", { count: "exact", head: true })
+        .eq("search_id", args.searchId!)
+        .eq("email_status", "not_enriched")
+        .not("website", "is", null)
+        .neq("website", "");
+
+      return {
+        dryRun: false,
+        mode: "new",
+        selected: ids.length,
+        processed: ids.length,
+        found: 0,
+        notFound: 0,
+        failed: ids.length,
+        remaining: remaining ?? 0,
+        scope: null as never,
+        results: [],
+      };
+    }) as unknown as typeof import("@/server/enrichment/run-enrichment").runEnrichment;
+
+    const deps = {
+      runTick: makeTickFake({ asked: [] }),
+      runEnrichment: recordingEnrichment,
+    };
+
+    let state = await stateModule.loadGenerationState({ runId: created.runId, userId });
+    for (let i = 0; i < 40 && state.status === "running" && state.canAdvance; i += 1) {
+      state = await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
+    }
+
+    // The lifecycle finished rather than looping over the failures.
+    expect(state.status).toBe("completed");
+    expect(state.enrichment.failed).toBeGreaterThan(0);
+
+    // NO LEAD WAS OFFERED TWICE. This is the property that keeps the automatic
+    // flow from becoming a retry loop against someone else's web server.
+    const all = seenLeadIds.flat();
+    expect(new Set(all).size).toBe(all.length);
+
+    // And exactly one attempt was recorded per lead.
+    const { data: leadIds } = await db.from("leads").select("id").eq("search_id", created.searchId);
+    const { data: attempts } = await db
+      .from("lead_enrichment_attempts")
+      .select("lead_id")
+      .in(
+        "lead_id",
+        (leadIds ?? []).map((lead) => lead.id),
+      );
+
+    const perLead = new Map<string, number>();
+    for (const attempt of attempts ?? []) {
+      perLead.set(attempt.lead_id, (perLead.get(attempt.lead_id) ?? 0) + 1);
+    }
+    for (const count of perLead.values()) expect(count).toBe(1);
+  });
+
+  it("resets the liveness counter when real progress happens", async () => {
+    const created = await createRun({ enrichEmails: false });
+    const deps = {
+      runTick: makeTickFake({ asked: [] }),
+      runEnrichment: makeEnrichmentFake({ calls: 0 }),
+    };
+
+    await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
+
+    const { data: run } = await db
+      .from("generation_runs")
+      .select("no_progress_ticks")
+      .eq("id", created.runId)
+      .single();
+
+    // A productive slice leaves the counter at zero, so a slow run is never
+    // mistaken for a stuck one.
+    expect(run!.no_progress_ticks).toBe(0);
   });
 
   it("counts a continuation's ceiling from a fresh watermark", async () => {

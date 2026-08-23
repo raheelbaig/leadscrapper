@@ -15,10 +15,12 @@ import { areasAllowedThisAdvance, callsUsedByRun, GENERATION_LIMITS } from "./li
  */
 
 describe("GENERATION_LIMITS", () => {
-  it("permits exactly the approved number of Google calls per generation run", () => {
-    // APPROVED 2026-08-23. Raising this is a spending decision, not a tuning
-    // decision -- it multiplies what a single press can spend.
-    expect(GENERATION_LIMITS.maxGoogleCallsPerRun).toBe(30);
+  it("lets one press approve the whole lifecycle, bounded by the hard limit", () => {
+    // PRODUCT DECISION 2026-08-23: a press approves the whole job, so the run
+    // ceiling IS the per-search spending limit rather than a second, narrower
+    // gate in front of it. Derived, never a literal, so the two can never drift.
+    expect(GENERATION_LIMITS.maxGoogleCallsPerRun).toBe(SEARCH_LIMITS.maxCallsPerSearch);
+    expect(GENERATION_LIMITS.maxGoogleCallsPerRun).toBe(150);
   });
 
   it("derives the per-area worst case from the page and attempt caps", () => {
@@ -30,11 +32,18 @@ describe("GENERATION_LIMITS", () => {
     expect(GENERATION_LIMITS.worstCaseCallsPerArea).toBe(9);
   });
 
-  it("sits inside the per-search budget, which sits inside the monthly allowance", () => {
-    // The hierarchy, narrowest first. A generation ceiling above the per-search
-    // budget would never bind, and the number the user approved would be
-    // decorative.
-    expect(GENERATION_LIMITS.maxGoogleCallsPerRun).toBeLessThan(SEARCH_LIMITS.maxCallsPerSearch);
+  it("never permits a run to spend more than the per-search budget allows", () => {
+    // THE INVARIANT THAT SURVIVED THE POLICY CHANGE. Removing the 30-call gate
+    // must never have raised what a run can spend above the hard limit.
+    expect(GENERATION_LIMITS.maxGoogleCallsPerRun).toBeLessThanOrEqual(
+      SEARCH_LIMITS.maxCallsPerSearch,
+    );
+  });
+
+  it("bounds the self-advancing loop with a liveness limit", () => {
+    // A run that asks for its own next slice can spin. This is what stops it.
+    expect(GENERATION_LIMITS.maxNoProgressAdvances).toBeGreaterThan(0);
+    expect(GENERATION_LIMITS.maxNoProgressAdvances).toBeLessThanOrEqual(10);
   });
 
   it("keeps the per-advance email batch inside the enrichment subsystem's own cap", () => {
@@ -56,9 +65,9 @@ describe("areasAllowedThisAdvance", () => {
    * THE GUARANTEE.
    *
    * The tick runner checks its budgets BETWEEN areas, not between pages, so an
-   * area started with the ceiling one call away could still spend nine. The
+   * area started with the limit one call away could still spend nine. The
    * orchestrator therefore never starts an area it could not afford in full.
-   * This is the property that makes "at most 30" true rather than approximate.
+   * This is the property that makes the ceiling exact rather than approximate.
    */
   it("never permits a worst case above what is left", () => {
     for (let remaining = 0; remaining <= 200; remaining += 1) {
@@ -68,14 +77,20 @@ describe("areasAllowedThisAdvance", () => {
   });
 
   it("stops the run while fewer calls remain than one area could cost", () => {
-    // 8 of the 30 unspent, and the run stops rather than risking a 31st call.
-    // The UI states this rather than rounding it away.
+    // Eight calls left is not enough to start an area that could cost nine, so
+    // the run stops with them unspent rather than risking one call too many.
+    // The UI states that plainly rather than rounding it away.
     expect(areasAllowedThisAdvance(8)).toBe(0);
     expect(areasAllowedThisAdvance(9)).toBe(1);
   });
 
-  it("allows three areas on a fresh approval", () => {
-    expect(areasAllowedThisAdvance(GENERATION_LIMITS.maxGoogleCallsPerRun)).toBe(3);
+  it("uses full slices on a fresh approval now that one press approves the job", () => {
+    // floor(150 / 9) = 16, clamped to the tick runner's own cap of 12. Under the
+    // old 30-call gate this was 3, which is what made a real city take several
+    // presses to search.
+    expect(areasAllowedThisAdvance(GENERATION_LIMITS.maxGoogleCallsPerRun)).toBe(
+      SEARCH_LIMITS.maxTilesPerTick,
+    );
   });
 
   it("is clamped by the tick runner's own area cap", () => {

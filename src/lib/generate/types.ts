@@ -108,6 +108,14 @@ export type GenerationState = {
   blockedReason: string | null;
   /** The friendly current-step line, e.g. "Searching local businesses...". */
   headline: string;
+  /** The page heading. Only ever "Your leads are ready" when truly complete. */
+  title: string;
+  /** What the user is told is happening. Computed on the server. */
+  displayState: GenerationDisplayState;
+  /** The three-step flow, ready to render. */
+  steps: GenerationStep[];
+  /** True once the whole lifecycle finished successfully. Gates the export CTA. */
+  lifecycleComplete: boolean;
 
   search: GenerationSearchProgress;
   enrichment: GenerationEnrichmentProgress;
@@ -124,19 +132,50 @@ export type GenerationState = {
  * different budget was satisfied.
  *
  * Note what is absent, here as everywhere: any reason involving the lead
- * target.
+ * target. Also absent since the lifecycle change is any reason that means
+ * "this slice ended" -- a slice ending is not an ending, it is the loop.
  */
 export type GenerationStopReason =
-  /** Every leaf area accounted for AND email discovery finished. The only success. */
+  /** Coverage complete AND email discovery exhausted. The only success. */
   | "generation_complete"
-  /** This approval's Google-call ceiling is spent. A new approval continues it. */
-  | "generation_call_ceiling"
+  /**
+   * A HARD limit stopped it: the per-search call budget, or the protected
+   * monthly allowance. Not a failure and not something to press through -- the
+   * money guard did its job, and the UI says so plainly.
+   */
+  | "safety_limit_reached"
   /** The user pressed Stop. */
   | "stopped_by_user"
-  /** The search paused with geography owed for a reason of its own. */
-  | "search_paused"
-  /** The pre-flight or quota refused the run. Nothing was spent. */
+  /** The pre-flight refused before anything was spent. */
   | "blocked"
   /** Leads collected, but email discovery was never consented to. */
   | "enrichment_not_consented"
+  /** The self-advancing loop stopped changing anything. See `maxNoProgressAdvances`. */
+  | "no_progress"
   | "failed";
+
+/**
+ * What the user is told is happening, derived on the server from the run's
+ * status, phase and remaining work.
+ *
+ * The UI renders this and never computes it. That is what stops the results
+ * page from saying "ready" over an incomplete run: readiness is a server
+ * conclusion about coverage and email discovery, not a client guess about
+ * whether a request is in flight.
+ */
+export type GenerationDisplayState =
+  | "searching"
+  | "finding-emails"
+  | "preparing"
+  | "ready"
+  | "paused-for-safety"
+  | "stopped"
+  | "failed";
+
+export type GenerationStepId = "search" | "emails" | "results";
+
+export type GenerationStep = {
+  id: GenerationStepId;
+  label: string;
+  state: "done" | "active" | "pending" | "blocked";
+};

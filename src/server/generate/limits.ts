@@ -6,19 +6,25 @@ import { SEARCH_LIMITS } from "@/server/search/limits";
 /**
  * The spending envelope of ONE approval in the guided flow.
  *
- * THE HIERARCHY, narrowest first. Each ceiling sits inside the next and none
- * may ever exceed it:
+ * ONE PRESS APPROVES THE WHOLE LIFECYCLE.
  *
- *   per generation run   30 Google calls   <- APPROVED 2026-08-23, here
- *   per search          150 Google calls   <- SEARCH_LIMITS.maxCallsPerSearch
- *   per month            protected free allowance, from the quota service
+ * 0014 put a 30-call gate in front of the run, so a press authorised 30 calls
+ * and then stopped to ask again. A real city needs roughly ninety, so getting
+ * one lead list meant pressing "Continue generation" three times. That is a
+ * console, not a product, and the gate was removed by product decision on
+ * 2026-08-23.
  *
- * Why a third ceiling at all. Before the guided flow, one press of Run was one
- * tick, and the person pressing it saw the pre-flight numbers each time -- the
- * approval and the spending were the same act. A single button that drives a
- * run to completion breaks that: it makes many ticks from one press. This
- * ceiling is what a person is agreeing to when they press Generate Leads, and
- * reaching it stops the run and asks again rather than continuing quietly.
+ * THE HIERARCHY IS NOW TWO DEEP, and every level is a HARD limit enforced by
+ * the code that spends:
+ *
+ *   per search   150 Google calls   <- SEARCH_LIMITS.maxCallsPerSearch,
+ *                                     checked by the tick runner between areas
+ *   per month    the protected free allowance minus its reserve,
+ *                                     checked by reserve_api_calls() per page
+ *
+ * NOTHING WAS WEAKENED. What was removed is a gate the user pressed through;
+ * what remains is every gate that protects the money. Reaching one of them ends
+ * the run with an honest "paused for safety" state.
  *
  * Nothing here may be raised by the browser. `call_ceiling` is written to
  * `generation_runs` from this constant at approval time and read back from the
@@ -28,17 +34,16 @@ export const GENERATION_LIMITS = {
   /**
    * Billable Google calls ONE approval permits.
    *
-   * APPROVED 2026-08-23: 30 calls.
+   * DELIBERATELY THE SAME NUMBER as the per-search budget. The run ceiling is
+   * no longer an independent gate -- it is the hard limit, restated on the run
+   * row so that "Google calls used" on the results page and the limit that
+   * actually stops the work are guaranteed to be the same figure.
    *
-   * 30 of the 936 protected Enterprise calls currently remaining is about 3% of
-   * the month. At the ~1.05 calls per tile actually observed across the four
-   * real searches to date, it covers roughly 28 areas -- comfortably more than
-   * the 6-area grids the flow produces for a city test box, and enough that a
-   * typical guided run finishes inside a single approval.
-   *
-   * Raising this is a spending decision, not a tuning decision.
+   * Derived rather than written as 150, so that changing the approved
+   * per-search spending ceiling can never leave a stale copy here disagreeing
+   * with it.
    */
-  maxGoogleCallsPerRun: 30,
+  maxGoogleCallsPerRun: SEARCH_LIMITS.maxCallsPerSearch,
 
   /**
    * Worst case for ONE area, derived rather than chosen: three pages, each
@@ -63,14 +68,30 @@ export const GENERATION_LIMITS = {
    * still applies underneath and is never widened.
    */
   enrichmentLeadsPerAdvance: 5,
+
+  /**
+   * Consecutive advances that may change nothing before the run gives up.
+   *
+   * THE LIVENESS BOUND FOR A SELF-ADVANCING RUN. While a press approved only
+   * one slice, the human was the loop condition and a stuck run simply sat
+   * there. Now the orchestrator advances itself, so a tick that can do nothing
+   * and spend nothing -- a lease it cannot claim, a tile that errors before any
+   * request is authorised -- would otherwise be retried forever.
+   *
+   * Five is enough to ride out a lease held by a slice that is still finishing,
+   * and small enough that a genuinely stuck run surfaces in seconds rather than
+   * grinding. Any advance that completes an area or spends a call resets it, so
+   * a merely slow run is never mistaken for a stuck one.
+   */
+  maxNoProgressAdvances: 5,
 } as const;
 
 if (GENERATION_LIMITS.maxGoogleCallsPerRun > SEARCH_LIMITS.maxCallsPerSearch) {
-  // A generation ceiling above the per-search budget would be a ceiling that
-  // never binds -- the wider limit would stop the run first and the number the
-  // user approved would be decorative. Fail at import rather than at runtime.
+  // A generation ceiling ABOVE the per-search budget would be the one thing
+  // this file must never express: a run permitted to spend more than the hard
+  // limit allows. Fail at import rather than at runtime.
   throw new Error(
-    "GENERATION_LIMITS.maxGoogleCallsPerRun must sit inside SEARCH_LIMITS.maxCallsPerSearch",
+    "GENERATION_LIMITS.maxGoogleCallsPerRun must never exceed SEARCH_LIMITS.maxCallsPerSearch",
   );
 }
 

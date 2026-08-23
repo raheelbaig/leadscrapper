@@ -1,6 +1,6 @@
 "use client";
 
-import { ChevronDown, Loader2, Mail, Search, Square } from "lucide-react";
+import { Check, ChevronDown, Circle, Loader2, Square, X } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
@@ -10,35 +10,49 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { formatNumber, formatPercent } from "@/lib/format";
-import type { GenerationState } from "@/lib/generate/types";
+import type { GenerationState, GenerationStep } from "@/lib/generate/types";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { cn } from "@/lib/utils";
 
 /**
- * The processing screen.
+ * The processing screen: one continuous process, three visible steps.
  *
  * ---------------------------------------------------------------------------
- * THE BROWSER IS A TRIGGER, NOT A WORKER.
+ * THE CLIENT HOLDS NO BUSINESS LOGIC.
  *
- * This component does exactly two things: it asks the server to continue, and
- * it renders what the server says. It never reaches Google, never reaches a
- * business website, never decides a budget, never chooses an area or a lead,
- * and never holds a figure Postgres does not already hold. Every number below
- * arrived from `/api/generate/[id]/state`.
+ * It does exactly three things: ask the server to continue, render what comes
+ * back, and offer Stop. It does not decide how many areas a slice may search,
+ * whether quota allows a request, when the search is complete, how many email
+ * batches remain, or when to move between steps. Every one of those is a server
+ * conclusion that arrives in the state payload -- including the heading and the
+ * step markers below, which are computed in `describeRun`.
  *
- * Closing the tab stops the ASKING. It does not roll anything back and it does
- * not corrupt anything: the run stays exactly where the database says it is,
- * with its remaining area still owed, and reopening the page resumes from
- * there. The screen says so in plain words rather than implying that work
- * continues on its own — the durable worker that would make that true is built
- * but switched off.
+ * It also never reaches Google or a business website. The only host it talks to
+ * is this application's own API.
  *
- * Two concurrent advances are prevented by the database lease, not by the
- * `inFlight` ref below. The ref is a courtesy that avoids a pointless request;
- * the guarantee is `claim_search_job_by_id`, which a second caller simply would
- * not win.
+ * ONE PRESS, WHOLE LIFECYCLE. The user approved the generation, not each slice,
+ * so this asks for the next slice automatically until the server stops saying
+ * there is more to do. What bounds that is not the user's patience but the hard
+ * limits the server enforces: the per-search call budget, the protected monthly
+ * allowance, and a liveness guard that halts a run which stops progressing.
+ *
+ * WHAT CLOSING THE TAB DOES. It stops the asking. Nothing is lost, nothing is
+ * rolled back, and everything collected stays exactly where the database has
+ * it -- but work does NOT continue on its own, because the durable worker is
+ * switched off. The screen says that plainly rather than implying otherwise,
+ * and reopening the generation resumes it from the same point.
  * ---------------------------------------------------------------------------
  */
+
+/**
+ * Breathing room between slices.
+ *
+ * Not a rate limit -- the server owns every real limit. It keeps a run that is
+ * ending, erroring, or briefly not progressing from becoming a tight request
+ * loop before the server's own liveness guard has counted far enough to halt it.
+ */
+const ADVANCE_GAP_MS = 400;
+
 export function ProcessingView({ initialState }: { initialState: GenerationState }) {
   const [state, setState] = useState<GenerationState>(initialState);
   const [error, setError] = useState<string | null>(null);
@@ -71,10 +85,14 @@ export function ProcessingView({ initialState }: { initialState: GenerationState
     }
   }, [runId]);
 
-  // ---- the advance loop ---------------------------------------------------
-  // One request at a time, re-triggered by the state it produces. Written as a
-  // reaction to state rather than as a `while` loop so that a stop, an error or
-  // a phase change ends it by simply being the new state.
+  // ---- the lifecycle loop -------------------------------------------------
+  // One request at a time, re-triggered by the state it produces, until the
+  // server stops saying there is more to do. Written as a reaction to state
+  // rather than a `while` loop so a stop, an error or a finished lifecycle ends
+  // it simply by being the new state.
+  //
+  // Two concurrent advances are prevented by the database lease, not by the
+  // `inFlight` ref -- the ref only avoids a pointless request.
   useEffect(() => {
     if (inFlight.current) return;
     if (state.status !== "running" || !state.canAdvance) return;
@@ -82,7 +100,7 @@ export function ProcessingView({ initialState }: { initialState: GenerationState
     inFlight.current = true;
     let alive = true;
 
-    (async () => {
+    const timer = setTimeout(async () => {
       try {
         const response = await fetch(`/api/generate/${runId}/advance`, { method: "POST" });
         const payload = await response.json();
@@ -105,18 +123,19 @@ export function ProcessingView({ initialState }: { initialState: GenerationState
       } finally {
         inFlight.current = false;
       }
-    })();
+    }, ADVANCE_GAP_MS);
 
     return () => {
       alive = false;
+      clearTimeout(timer);
+      inFlight.current = false;
     };
   }, [state, runId]);
 
   // ---- live progress within a slice --------------------------------------
-  // An advance can take up to a minute, and the search row is updated by the
-  // heartbeat throughout. Subscribing means the figures move while a slice is
-  // running rather than jumping once it ends. The browser is still only a
-  // viewer here: it re-reads server state, it does not compute any of it.
+  // A slice can take up to a minute and the search row is updated by the
+  // heartbeat throughout, so the figures move while it runs instead of jumping
+  // when it ends. The browser is still only a viewer: it re-reads server state.
   useEffect(() => {
     const supabase = getSupabaseBrowserClient();
     const channel = supabase
@@ -143,7 +162,7 @@ export function ProcessingView({ initialState }: { initialState: GenerationState
   // ---- finished -----------------------------------------------------------
   useEffect(() => {
     if (state.status === "running") return;
-    const timer = setTimeout(() => router.replace(`/generate/${runId}/results`), 900);
+    const timer = setTimeout(() => router.replace(`/generate/${runId}/results`), 1_200);
     return () => clearTimeout(timer);
   }, [state.status, runId, router]);
 
@@ -157,24 +176,27 @@ export function ProcessingView({ initialState }: { initialState: GenerationState
         return;
       }
       setState(payload as GenerationState);
-      toast.info("Stopped. Everything found so far has been kept.");
+      toast.info("Generation stopped. Everything found so far has been kept.");
     } finally {
       setStopping(false);
     }
   }
 
-  const searching = state.phase === "searching";
   const working = state.status === "running";
+  const searching = state.displayState === "searching";
+  const findingEmails = state.displayState === "finding-emails";
+
+  // The step that is running decides which estimate is the relevant one.
+  const eta = searching ? state.search.eta : state.enrichment.eta;
 
   return (
     <div className="space-y-4">
+      {/* ---- Heading, timer, steps, stop ---- */}
       <Card>
         <CardHeader>
           <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <CardTitle className="text-xl">
-                {working ? "Generating your leads" : "Generation finished"}
-              </CardTitle>
+            <div className="min-w-0">
+              <CardTitle className="text-xl">{state.title}</CardTitle>
               <CardDescription>
                 {state.niche} · {state.locationLabel}
               </CardDescription>
@@ -192,141 +214,136 @@ export function ProcessingView({ initialState }: { initialState: GenerationState
                 ) : (
                   <Square className="size-3.5" />
                 )}
-                Stop
+                Stop generation
               </Button>
             ) : null}
           </div>
         </CardHeader>
-        <CardContent className="space-y-1">
-          <div className="flex items-center gap-2 text-sm">
+
+        <CardContent className="space-y-5">
+          <div className="flex flex-wrap items-center gap-x-8 gap-y-2 text-sm">
+            <span className="text-muted-foreground">
+              Elapsed{" "}
+              <ElapsedTimer
+                startedAt={state.createdAt}
+                endedAt={state.completedAt}
+                className="text-foreground font-mono font-semibold"
+              />
+            </span>
+            {working ? (
+              <span className="text-muted-foreground">
+                Estimated remaining <span className="text-foreground font-medium">{eta.label}</span>
+              </span>
+            ) : null}
+          </div>
+
+          <ol className="space-y-2.5">
+            {state.steps.map((step) => (
+              <StepRow key={step.id} step={step} />
+            ))}
+          </ol>
+
+          <p className="flex items-center gap-2 text-sm">
             {working ? <Loader2 className="text-primary size-4 animate-spin" /> : null}
             <span className="font-medium">{state.headline}</span>
-          </div>
-          <p className="text-muted-foreground text-xs">
-            Total elapsed <ElapsedTimer startedAt={state.createdAt} endedAt={state.completedAt} />
           </p>
         </CardContent>
       </Card>
 
-      {/* ---- Phase 1: searching ---- */}
-      <PhaseCard
-        icon={Search}
-        title="Searching businesses"
-        active={searching && working}
-        done={!searching}
-      >
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <Figure
-            label="Leads found"
-            value={formatNumber(state.search.leadsFound)}
-            hint={`minimum target ${formatNumber(state.search.targetLeads)}`}
-          />
-          <Figure
-            label="Area searched"
-            value={formatPercent(state.search.coveragePct, 0)}
-            hint={`${formatNumber(state.search.areasSearched)} of ${formatNumber(state.search.areasTotal)} sections`}
-          />
-          <Figure
-            label="Elapsed"
-            value={
-              <ElapsedTimer startedAt={state.search.startedAt} endedAt={state.search.completedAt} />
-            }
-            raw
-          />
-          <Figure label="Remaining" value={state.search.eta.label} raw small />
-        </div>
-
-        <Progress value={Math.min(state.search.coveragePct, 100)} className="mt-4" />
-
-        {state.search.targetReached && state.search.leadsFound > state.search.targetLeads ? (
-          <p className="text-muted-foreground mt-3 text-xs">
-            {formatNumber(state.search.leadsFound)} leads — past the{" "}
-            {formatNumber(state.search.targetLeads)} you asked for. The target is a minimum, so the
-            search keeps going until the area is covered.
-          </p>
-        ) : null}
-      </PhaseCard>
-
-      {/* ---- Phase 2: emails ---- */}
-      <PhaseCard
-        icon={Mail}
-        title="Finding business emails"
-        active={!searching && working}
-        done={state.phase === "ready"}
-        muted={searching}
-      >
-        {searching ? (
-          <p className="text-muted-foreground text-sm">
-            {state.enrichment.consented
-              ? "Starts automatically once the area has been searched."
-              : "Not part of this generation — you can start it afterwards."}
-          </p>
-        ) : (
-          <>
+      {/* ---- Detail for the running step ---- */}
+      {searching ? (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm">Searching businesses</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
             <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+              <Figure
+                label="Leads found"
+                value={formatNumber(state.search.leadsFound)}
+                hint={`minimum target ${formatNumber(state.search.targetLeads)}`}
+              />
+              <Figure
+                label="Area searched"
+                value={formatPercent(state.search.coveragePct, 0)}
+                hint={`${formatNumber(state.search.areasSearched)} of ${formatNumber(state.search.areasTotal)} sections`}
+              />
+              <Figure
+                label="Sections remaining"
+                value={formatNumber(state.search.areasRemaining)}
+                hint={`${state.search.areaOwedKm2.toFixed(0)} km² still to search`}
+              />
+              <Figure
+                label="Elapsed in this step"
+                value={
+                  <ElapsedTimer
+                    startedAt={state.search.startedAt}
+                    endedAt={state.search.completedAt}
+                  />
+                }
+                mono
+              />
+            </div>
+            <Progress value={Math.min(state.search.coveragePct, 100)} />
+            {state.search.targetReached && state.search.leadsFound > state.search.targetLeads ? (
+              <p className="text-muted-foreground text-xs">
+                {formatNumber(state.search.leadsFound)} leads — already past the{" "}
+                {formatNumber(state.search.targetLeads)} you asked for. That target is a minimum, so
+                we keep going until the whole area has been searched.
+              </p>
+            ) : null}
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {findingEmails ? (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm">Finding business emails</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+              <Figure
+                label="Businesses with a website"
+                value={formatNumber(state.enrichment.leadsWithWebsite)}
+                hint={`${formatNumber(state.enrichment.leadsWithoutWebsite)} have none to check`}
+              />
               <Figure
                 label="Emails found"
                 value={formatNumber(state.enrichment.found)}
-                hint={`${formatNumber(state.enrichment.leadsWithWebsite)} leads have a website`}
+                hint={`${formatNumber(state.enrichment.notFound)} publish no address`}
               />
               <Figure
-                label="Checked"
-                value={`${formatNumber(state.enrichment.checked)} / ${formatNumber(state.enrichment.leadsWithWebsite)}`}
-                hint={`${formatNumber(state.enrichment.notFound)} without an address · ${formatNumber(state.enrichment.failed)} unreachable`}
+                label="Still to check"
+                value={formatNumber(state.enrichment.remaining)}
+                hint={`${formatNumber(state.enrichment.failed)} could not be checked`}
               />
               <Figure
-                label="Elapsed"
+                label="Elapsed in this step"
                 value={
                   <ElapsedTimer
                     startedAt={state.enrichment.startedAt}
                     endedAt={state.enrichment.completedAt}
                   />
                 }
-                raw
+                mono
               />
-              <Figure label="Remaining" value={state.enrichment.eta.label} raw small />
             </div>
-
             <Progress
               value={
                 state.enrichment.leadsWithWebsite > 0
                   ? (state.enrichment.checked / state.enrichment.leadsWithWebsite) * 100
                   : 0
               }
-              className="mt-4"
             />
-
-            <p className="text-muted-foreground mt-3 text-xs">
+            <p className="text-muted-foreground text-xs">
               Checking public business websites for contact emails, one business at a time.
             </p>
-          </>
-        )}
-      </PhaseCard>
+          </CardContent>
+        </Card>
+      ) : null}
 
-      {/* ---- Approval budget ---- */}
-      <Card>
-        <CardContent className="flex flex-wrap items-center gap-x-6 gap-y-2 pt-6 text-xs">
-          <span className="text-muted-foreground">
-            Google requests used in this approval{" "}
-            <span className="text-foreground font-semibold tabular-nums">
-              {formatNumber(state.budget.used)} / {formatNumber(state.budget.ceiling)}
-            </span>
-          </span>
-          <span className="text-muted-foreground">
-            Remaining in this approval{" "}
-            <span className="text-foreground font-semibold tabular-nums">
-              {formatNumber(state.budget.remaining)}
-            </span>
-          </span>
-          <span className="text-muted-foreground">
-            Protected monthly quota{" "}
-            <span className="text-foreground font-semibold tabular-nums">
-              {formatNumber(state.budget.quotaRemaining)} left
-            </span>
-          </span>
-        </CardContent>
-      </Card>
-
+      {/* ---- Errors and honest endings ---- */}
       {error ? (
         <Card className="border-red-500/40 bg-red-500/5">
           <CardContent className="space-y-2 pt-6">
@@ -338,11 +355,19 @@ export function ProcessingView({ initialState }: { initialState: GenerationState
         </Card>
       ) : null}
 
-      {/* ---- Honest note about the tab ---- */}
+      {state.blockedReason && !working ? (
+        <Card className="border-amber-500/40 bg-amber-500/5">
+          <CardContent className="pt-6">
+            <p className="text-sm text-amber-700 dark:text-amber-400">{state.blockedReason}</p>
+          </CardContent>
+        </Card>
+      ) : null}
+
       {working ? (
         <p className="text-muted-foreground text-xs">
           Keep this tab open while it works. If you close it, nothing is lost and nothing is undone
-          — the generation simply pauses where it is, and reopening this page continues it.
+          — but the generation pauses where it is rather than carrying on in the background, and
+          reopening this page continues it.
         </p>
       ) : null}
 
@@ -363,16 +388,25 @@ export function ProcessingView({ initialState }: { initialState: GenerationState
             <TechRow label="Run" value={state.runId} />
             <TechRow label="Search" value={state.searchId} />
             <TechRow label="Phase" value={state.phase} />
+            <TechRow label="Display state" value={state.displayState} />
             <TechRow label="Run status" value={state.status} />
             <TechRow label="Search status" value={state.search.searchStatus} />
             <TechRow label="Stop reason" value={state.stopReason ?? "—"} />
             <TechRow
-              label="Sections remaining"
-              value={`${state.search.areasRemaining} (${state.search.areaOwedKm2.toFixed(1)} km² unsearched)`}
+              label="Google calls (this run)"
+              value={`${state.budget.used} / ${state.budget.ceiling}`}
             />
             <TechRow
-              label="Search call budget"
+              label="Google calls (this search)"
               value={`${state.budget.searchCallsUsed} / ${state.budget.searchCallBudget}`}
+            />
+            <TechRow
+              label="Protected quota left"
+              value={`${formatNumber(state.budget.quotaRemaining)} of ${formatNumber(state.budget.quotaFreeLimit)}`}
+            />
+            <TechRow
+              label="Sections remaining"
+              value={`${state.search.areasRemaining} (${state.search.areaOwedKm2.toFixed(1)} km²)`}
             />
             <TechRow
               label="ETA basis (search)"
@@ -401,32 +435,53 @@ export function ProcessingView({ initialState }: { initialState: GenerationState
   );
 }
 
-function PhaseCard({
-  icon: Icon,
-  title,
-  active,
-  done,
-  muted,
-  children,
-}: {
-  icon: typeof Search;
-  title: string;
-  active: boolean;
-  done: boolean;
-  muted?: boolean;
-  children: React.ReactNode;
-}) {
+/** One row of the three-step flow. */
+function StepRow({ step }: { step: GenerationStep }) {
+  const icon =
+    step.state === "done" ? (
+      <Check className="size-3.5" />
+    ) : step.state === "active" ? (
+      <Loader2 className="size-3.5 animate-spin" />
+    ) : step.state === "blocked" ? (
+      <X className="size-3.5" />
+    ) : (
+      <Circle className="size-2" />
+    );
+
   return (
-    <Card className={cn(active && "border-primary/40", muted && "opacity-70")}>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2 text-sm">
-          <Icon className={cn("size-4", active ? "text-primary" : "text-muted-foreground")} />
-          {title}
-          {done ? <span className="text-muted-foreground text-xs font-normal">· done</span> : null}
-        </CardTitle>
-      </CardHeader>
-      <CardContent>{children}</CardContent>
-    </Card>
+    <li className="flex items-center gap-3">
+      <span
+        aria-hidden
+        className={cn(
+          "flex size-6 shrink-0 items-center justify-center rounded-full border",
+          step.state === "done" &&
+            "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400",
+          step.state === "active" && "border-primary/40 bg-primary/10 text-primary",
+          step.state === "blocked" && "text-muted-foreground border-dashed",
+          step.state === "pending" && "text-muted-foreground/50 border-dashed",
+        )}
+      >
+        {icon}
+      </span>
+      <span
+        className={cn(
+          "text-sm",
+          step.state === "active" && "font-medium",
+          (step.state === "pending" || step.state === "blocked") && "text-muted-foreground",
+        )}
+      >
+        {step.label}
+      </span>
+      <span className="sr-only">
+        {step.state === "done"
+          ? "completed"
+          : step.state === "active"
+            ? "in progress"
+            : step.state === "blocked"
+              ? "not done"
+              : "waiting"}
+      </span>
+    </li>
   );
 }
 
@@ -434,29 +489,19 @@ function Figure({
   label,
   value,
   hint,
-  raw,
-  small,
+  mono,
 }: {
   label: string;
   value: React.ReactNode;
   hint?: string;
-  raw?: boolean;
-  small?: boolean;
+  mono?: boolean;
 }) {
   return (
     <div className="space-y-0.5">
       <p className="text-muted-foreground text-[11px] font-medium tracking-wide uppercase">
         {label}
       </p>
-      <p
-        className={cn(
-          "font-semibold tabular-nums",
-          small ? "text-sm" : "text-base",
-          raw && "font-mono",
-        )}
-      >
-        {value}
-      </p>
+      <p className={cn("text-base font-semibold tabular-nums", mono && "font-mono")}>{value}</p>
       {hint ? <p className="text-muted-foreground text-[11px]">{hint}</p> : null}
     </div>
   );

@@ -14,14 +14,30 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Progress } from "@/components/ui/progress";
 import { formatNumber, formatPercent, formatRelative } from "@/lib/format";
 import { cn } from "@/lib/utils";
+import { getCurrentUser } from "@/server/db/server-client";
 import { getDashboardSummary } from "@/server/db/queries/dashboard";
+import { loadGenerationState } from "@/server/generate/state";
 import { getUsageSummary } from "@/server/quota/usage-report";
 
 export const metadata: Metadata = { title: "Dashboard" };
 
 export default async function DashboardPage() {
-  const [summary, usage] = await Promise.all([getDashboardSummary(), getUsageSummary()]);
+  const [summary, usage, user] = await Promise.all([
+    getDashboardSummary(),
+    getUsageSummary(),
+    getCurrentUser(),
+  ]);
   const primarySku = usage.skus.find((sku) => sku.isPrimary) ?? usage.skus[0];
+
+  // The full state for the run still open, so the card can show what it has
+  // actually found rather than only that something is happening. Read from the
+  // database like everything else here, and only when there is a run to read.
+  const activeState =
+    summary.activeGeneration && user
+      ? await loadGenerationState({ runId: summary.activeGeneration.id, userId: user.id }).catch(
+          () => null,
+        )
+      : null;
 
   return (
     <>
@@ -36,24 +52,63 @@ export default async function DashboardPage() {
         }
       />
 
-      {summary.activeGeneration ? (
+      {/*
+       * AN ACTIVE GENERATION IS ALWAYS VISIBLE HERE.
+       *
+       * Navigating away from a generation must never lose it. Nothing about the
+       * run lives in the browser, so this card is rebuilt from Postgres on every
+       * request and "View progress" returns to the same stable URL, at the same
+       * point, on any device.
+       *
+       * The wording is deliberately careful. While the durable worker is off, a
+       * generation advances only when its page is open, so this says the run is
+       * waiting rather than implying it is grinding away on a server somewhere.
+       */}
+      {summary.activeGeneration && activeState ? (
         <Card className="border-primary/40 bg-primary/[0.03]">
-          <CardContent className="flex flex-wrap items-center justify-between gap-3 pt-6">
-            <div className="min-w-0">
-              <p className="text-sm font-medium">Generation in progress</p>
-              <p className="text-muted-foreground truncate text-xs">
-                {summary.activeGeneration.niche} · {summary.activeGeneration.label} ·{" "}
-                {summary.activeGeneration.phase === "searching"
-                  ? "searching businesses"
-                  : "finding business emails"}
-              </p>
+          <CardContent className="space-y-4 pt-6">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-sm font-medium">Generation in progress</p>
+                <p className="text-muted-foreground truncate text-sm">
+                  {activeState.niche} · {activeState.locationLabel}
+                </p>
+              </div>
+              <Link
+                href={`/generate/${summary.activeGeneration.id}`}
+                className={cn(buttonVariants({ size: "sm" }), "gap-2")}
+              >
+                View progress
+              </Link>
             </div>
-            <Link
-              href={`/generate/${summary.activeGeneration.id}`}
-              className={cn(buttonVariants({ size: "sm" }), "gap-2")}
-            >
-              View progress
-            </Link>
+
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+              <ActiveFigure
+                label="Leads found"
+                value={formatNumber(activeState.search.leadsFound)}
+              />
+              <ActiveFigure
+                label="Area searched"
+                value={formatPercent(activeState.search.coveragePct, 0)}
+              />
+              <ActiveFigure label="Step" value={activeState.headline} small />
+              <ActiveFigure
+                label="Estimated remaining"
+                value={
+                  activeState.displayState === "searching"
+                    ? activeState.search.eta.label
+                    : activeState.enrichment.eta.label
+                }
+                small
+              />
+            </div>
+
+            <Progress value={Math.min(activeState.search.coveragePct, 100)} />
+
+            <p className="text-muted-foreground text-xs">
+              Waiting for its page to continue — open it and the generation picks up exactly where
+              it left off. Nothing has been lost.
+            </p>
           </CardContent>
         </Card>
       ) : null}
@@ -245,5 +300,17 @@ export default async function DashboardPage() {
         </CardContent>
       </Card>
     </>
+  );
+}
+
+/** One figure on the active-generation card. */
+function ActiveFigure({ label, value, small }: { label: string; value: string; small?: boolean }) {
+  return (
+    <div className="space-y-0.5">
+      <p className="text-muted-foreground text-[11px] font-medium tracking-wide uppercase">
+        {label}
+      </p>
+      <p className={cn("font-semibold tabular-nums", small ? "text-sm" : "text-base")}>{value}</p>
+    </div>
   );
 }

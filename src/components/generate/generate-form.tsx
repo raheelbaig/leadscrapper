@@ -30,12 +30,17 @@ import { cn } from "@/lib/utils";
  * and one button. Everything that used to require walking Find Leads ->
  * Searches -> Run -> Enrichment -> Exports happens after the press.
  *
+ * ONE PRESS APPROVES THE WHOLE JOB. There is no second approval to press
+ * through: the generation searches, deduplicates, checks websites for emails
+ * and prepares the file, then stops on its own.
+ *
  * WHAT THE USER APPROVES IS ON SCREEN BEFORE THEY PRESS. The summary states the
- * estimate, the guaranteed maximum for this one approval, the protected quota
- * remaining, and -- when the area is bigger than one approval covers -- that
- * they will be asked again. The numbers are computed with the SAME pure
- * functions the server plans with (`gridDimensions`, `bboxAreaKm2`), so this
- * preview cannot promise a grid the server would build differently.
+ * estimate, the HARD maximum this run can ever spend, the protected quota
+ * remaining, and -- when the area is large enough that the limit will bind
+ * first -- that it will stop partway and say which area it did not reach. The
+ * numbers are computed with the SAME pure functions the server plans with
+ * (`gridDimensions`, `bboxAreaKm2`), so this preview cannot promise a grid the
+ * server would build differently.
  *
  * Validation uses the SHARED schema. The browser is not trusted with any of it:
  * the server re-validates, re-derives the grid, and reads the call ceiling from
@@ -339,9 +344,9 @@ export function GenerateForm({
               hint={plan ? `${formatNumber(plan.areas)} areas to search` : undefined}
             />
             <Figure
-              label="Maximum for this approval"
+              label="Hard maximum"
               value={plan ? formatNumber(plan.guaranteedMax) : formatNumber(callCeiling)}
-              hint="guaranteed, not an estimate"
+              hint="this run can never exceed it"
               emphasis
             />
             <Figure
@@ -351,12 +356,25 @@ export function GenerateForm({
             />
           </div>
 
+          {/*
+           * ONE PRESS APPROVES THE WHOLE JOB, so the number that matters is the
+           * hard maximum rather than a slice size -- and the user is told what
+           * happens if the area turns out to need more than that, rather than
+           * discovering it as a button they have to keep pressing.
+           */}
+          <p className="text-muted-foreground text-xs">
+            This one press runs the whole job: searching, removing duplicates, checking websites for
+            emails, and preparing your file. It stops on its own when the area has been covered — or
+            sooner if it reaches the {formatNumber(plan?.guaranteedMax ?? callCeiling)}-request
+            safety limit, which it will tell you about plainly. It never enters paid usage.
+          </p>
+
           {plan?.needsSeveralApprovals ? (
             <p className="rounded-lg border border-amber-500/40 bg-amber-500/5 p-3 text-xs text-amber-700 dark:text-amber-400">
-              This area is likely to need about {formatNumber(plan.estimatedCalls)} requests to
-              cover completely — more than one approval allows. This run will stop at{" "}
-              {formatNumber(plan.guaranteedMax)} and ask you before going further. Nothing continues
-              without you.
+              This area is large — covering it completely is likely to take about{" "}
+              {formatNumber(plan.estimatedCalls)} requests, more than the{" "}
+              {formatNumber(plan.guaranteedMax)} this run may make. Expect it to stop partway with
+              the area it did not reach listed for you. Nothing is spent beyond the limit.
             </p>
           ) : null}
 

@@ -4,8 +4,8 @@ import { ArrowUpDown, Check, Copy, ExternalLink, MapPin, Search } from "lucide-r
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
 
-import { EmailStatusBadge } from "@/components/leads/email-status-badge";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import {
   Table,
@@ -15,6 +15,12 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import {
+  EMAIL_FILTERS,
+  friendlyEmailStatus,
+  matchesEmailFilter,
+  type EmailFilterId,
+} from "@/lib/generate/email-status";
 import { cn } from "@/lib/utils";
 
 /**
@@ -41,18 +47,9 @@ export type ResultLead = {
 
 type SortKey = "name" | "email" | "city";
 
-const FILTERS = [
-  { id: "all", label: "All" },
-  { id: "with-email", label: "With email" },
-  { id: "with-website", label: "With website" },
-  { id: "no-email", label: "No email yet" },
-] as const;
-
-type FilterId = (typeof FILTERS)[number]["id"];
-
 export function ResultsLeadTable({ leads }: { leads: ResultLead[] }) {
   const [query, setQuery] = useState("");
-  const [filter, setFilter] = useState<FilterId>("all");
+  const [filter, setFilter] = useState<EmailFilterId>("all");
   const [sortKey, setSortKey] = useState<SortKey>("name");
   const [ascending, setAscending] = useState(true);
   const [copied, setCopied] = useState<string | null>(null);
@@ -61,9 +58,9 @@ export function ResultsLeadTable({ leads }: { leads: ResultLead[] }) {
     const needle = query.trim().toLowerCase();
 
     const matches = leads.filter((lead) => {
-      if (filter === "with-email" && !lead.email) return false;
-      if (filter === "with-website" && !lead.website) return false;
-      if (filter === "no-email" && lead.email) return false;
+      // The filter groups are the four distinctions that change what a user
+      // would do, not the six values of the database enum.
+      if (!matchesEmailFilter(filter, lead)) return false;
 
       if (!needle) return true;
       return [lead.name, lead.email, lead.city, lead.state, lead.website, lead.phone]
@@ -118,7 +115,7 @@ export function ResultsLeadTable({ leads }: { leads: ResultLead[] }) {
         </div>
 
         <div className="flex flex-wrap gap-1">
-          {FILTERS.map((option) => (
+          {EMAIL_FILTERS.map((option) => (
             <Button
               key={option.id}
               type="button"
@@ -192,7 +189,7 @@ export function ResultsLeadTable({ leads }: { leads: ResultLead[] }) {
                   )}
                 </TableCell>
                 <TableCell>
-                  <EmailStatusBadge status={lead.emailStatus} />
+                  <FriendlyStatus status={lead.emailStatus} />
                 </TableCell>
                 <TableCell className="text-muted-foreground text-right text-xs tabular-nums">
                   {lead.emailConfidence === null
@@ -278,5 +275,34 @@ function SortableHead({
         <ArrowUpDown className="size-3" />
       </button>
     </TableHead>
+  );
+}
+
+/**
+ * The email outcome in the words a business owner would use.
+ *
+ * The precise enum value stays available as the tooltip, and the export, the
+ * advanced Enrichment page and the technical details all still speak it. A
+ * normal user should not have to learn what `not_enriched` means to read their
+ * own lead list.
+ */
+function FriendlyStatus({ status }: { status: string }) {
+  const meta = friendlyEmailStatus(status);
+
+  return (
+    <Badge
+      variant="outline"
+      title={`${meta.detail} (${status})`}
+      className={cn(
+        "text-xs font-normal",
+        meta.tone === "positive" &&
+          "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400",
+        meta.tone === "warning" &&
+          "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400",
+        meta.tone === "neutral" && "bg-muted text-muted-foreground border-border",
+      )}
+    >
+      {meta.label}
+    </Badge>
   );
 }

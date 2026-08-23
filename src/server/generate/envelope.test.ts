@@ -37,6 +37,20 @@ function relative(file: string): string {
   return path.relative(ROOT, file).split(path.sep).join("/");
 }
 
+/**
+ * Source with comments removed.
+ *
+ * Needed because several of these assertions ban a STRING FROM THE UI, and the
+ * files that fixed those strings quite reasonably quote the old wording in a
+ * comment explaining what was fixed. Scanning raw text would make writing that
+ * explanation a test failure.
+ */
+function code(relativePath: string): string {
+  return read(relativePath)
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "");
+}
+
 describe("the ETA is presentation only", () => {
   /**
    * THE PROPERTY THAT MATTERS.
@@ -132,12 +146,21 @@ describe("the approval ceiling", () => {
   });
 
   it("matches the default written into the schema", () => {
-    const migration = read("supabase/migrations/0014_generation_runs.sql");
+    // 0014 created the column at the old 30-call gate; 0015 moved it to the hard
+    // per-search limit when one press became one whole lifecycle. The LATER
+    // migration is the one that has to agree with the constant.
+    const migration = read("supabase/migrations/0015_generation_lifecycle.sql");
     expect(migration).toMatch(
-      new RegExp(
-        `call_ceiling\\s+integer not null default ${GENERATION_LIMITS.maxGoogleCallsPerRun}`,
-      ),
+      new RegExp(`set default ${GENERATION_LIMITS.maxGoogleCallsPerRun}\\b`),
     );
+  });
+
+  it("records in the schema that no safety limit was weakened", () => {
+    // A reader six months from now will want to know exactly this, and the
+    // migration is where they will look first.
+    const migration = read("supabase/migrations/0015_generation_lifecycle.sql");
+    expect(migration).toMatch(/NO SAFETY LIMIT IS WEAKENED/i);
+    expect(migration).toMatch(/maxCallsPerSearch/);
   });
 });
 
@@ -201,5 +224,82 @@ describe("the lead target never becomes a stop condition", () => {
     expect(state).not.toMatch(/if\s*\([^)]*targetReached/);
     expect(orchestrator).not.toMatch(/targetReached/);
     expect(orchestrator).not.toMatch(/leadsFound\s*>=\s*targetLeads/);
+  });
+});
+
+describe("the one-click lifecycle", () => {
+  const RESULTS_PAGE = "src/app/(app)/generate/[id]/results/page.tsx";
+  const PROCESSING_VIEW = "src/components/generate/processing-view.tsx";
+
+  /**
+   * THE WORDING BUG THIS PASS EXISTS TO FIX.
+   *
+   * "Your leads so far are ready" appeared above a run that had searched a
+   * fraction of its area and stopped at a call ceiling. It is gone, and stays
+   * gone.
+   */
+  it("never renders 'so far' anywhere in the guided flow", () => {
+    const files = [
+      ...walk(path.resolve(SRC, "components/generate")),
+      ...walk(path.resolve(SRC, "app/(app)/generate")),
+      ...walk(path.resolve(SRC, "server/generate")),
+    ].filter((file) => !file.endsWith(".test.ts") && !file.endsWith(".test.tsx"));
+
+    for (const file of files) {
+      expect(code(relative(file))).not.toMatch(/so far are ready/i);
+    }
+  });
+
+  it("takes the results heading from the server rather than composing one", () => {
+    const page = code(RESULTS_PAGE);
+    // The heading is a server conclusion about coverage and email progress.
+    expect(page).toMatch(/title=\{state\.title\}/);
+    // And the page never hard-codes the success wording itself.
+    expect(page).not.toMatch(/"Your leads are ready"/);
+  });
+
+  it("keeps the manual Continue action out of the primary flow", () => {
+    const page = code(RESULTS_PAGE);
+    const advancedAt = page.indexOf("Advanced controls");
+
+    // Rendered USES of the component, not the import line.
+    const rendered = "<ContinueGenerationButton";
+    const continueAt = page.indexOf(rendered);
+
+    // It still exists as a recovery action, but only below the Advanced
+    // disclosure -- never among the primary buttons.
+    expect(advancedAt).toBeGreaterThan(-1);
+    expect(continueAt).toBeGreaterThan(advancedAt);
+
+    const primarySection = page.slice(0, advancedAt);
+    expect(primarySection).not.toMatch(/<ContinueGenerationButton/);
+    expect(primarySection).toMatch(/<ExportExcelButton/);
+  });
+
+  it("advances automatically instead of waiting for a press", () => {
+    const view = code(PROCESSING_VIEW);
+    // The loop is driven by state, not by an onClick.
+    expect(view).toMatch(/state\.canAdvance/);
+    expect(view).not.toMatch(/onClick=\{[^}]*advance/i);
+  });
+
+  it("is honest that work pauses when the tab closes", () => {
+    const view = read(PROCESSING_VIEW);
+    // Read WITH comments here: the promise is made in the rendered copy, and the
+    // module comment stating it is part of what must not regress.
+    // The durable worker is off, so the UI must not imply background execution.
+    expect(view).toMatch(/pauses where it is/i);
+    expect(view).not.toMatch(/keeps? running (on the server|in the background)/i);
+  });
+
+  it("keeps a Stop control on the running screen", () => {
+    expect(read(PROCESSING_VIEW)).toMatch(/Stop generation/);
+  });
+
+  it("holds no business logic in the client", () => {
+    const view = code(PROCESSING_VIEW);
+    // No budget arithmetic, no tile counting, no batch sizing in the browser.
+    expect(view).not.toMatch(/maxTilesPerTick|areasAllowed|callsUsed|enrichmentLeadsPerAdvance/);
+    expect(view).not.toMatch(/SEARCH_LIMITS|GENERATION_LIMITS/);
   });
 });

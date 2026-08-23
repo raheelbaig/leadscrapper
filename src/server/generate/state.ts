@@ -6,9 +6,11 @@ import { WORST_CASE_LEAD_MS, WORST_CASE_TILE_MS } from "@/lib/generate/calibrati
 import { elapsedSeconds, estimateRemaining } from "@/lib/generate/eta";
 import type {
   GenerationBudget,
+  GenerationDisplayState,
   GenerationEnrichmentProgress,
   GenerationSearchProgress,
   GenerationState,
+  GenerationStep,
 } from "@/lib/generate/types";
 import type { TileState } from "@/lib/tile-states";
 import type { Database } from "@/lib/database.types";
@@ -269,7 +271,7 @@ export async function buildGenerationState(
     quotaFreeLimit: quota.freeLimit,
   };
 
-  const { canAdvance, blockedReason, headline } = describeRun({
+  const described = describeRun({
     run,
     search: searchProgress,
     enrichment: enrichmentProgress,
@@ -288,9 +290,13 @@ export async function buildGenerationState(
     createdAt: run.created_at,
     completedAt: run.completed_at,
     totalElapsedSeconds: elapsedSeconds(run.created_at, run.completed_at, nowMs),
-    canAdvance,
-    blockedReason,
-    headline,
+    canAdvance: described.canAdvance,
+    blockedReason: described.blockedReason,
+    headline: described.headline,
+    title: described.title,
+    displayState: described.displayState,
+    steps: described.steps,
+    lifecycleComplete: described.lifecycleComplete,
     search: searchProgress,
     enrichment: enrichmentProgress,
     budget,
@@ -298,74 +304,212 @@ export async function buildGenerationState(
 }
 
 /**
- * Whether there is more work to ask for, and what to call what is happening.
+ * Whether there is more work to ask for, and what the user is told about it.
  *
- * Kept separate and free of I/O so the transitions can be tested against plain
- * objects. Every string here is the one a normal user reads -- no tile ids, no
- * RPC names, no stop-reason identifiers.
+ * Kept free of I/O so the transitions can be tested against plain objects.
+ * Every string here is the one a normal user reads -- no tile ids, no RPC
+ * names, no stop-reason identifiers.
+ *
+ * THE PAGE HEADING IS DECIDED HERE, on the server, from coverage and email
+ * progress. That is what makes "Your leads are ready" impossible to render over
+ * an incomplete run: readiness is a conclusion about the work, not a guess
+ * about whether a request happens to be in flight.
  */
 export function describeRun(input: {
   run: Pick<GenerationRunRow, "status" | "phase" | "stop_reason" | "enrichment_consented_at">;
   search: GenerationSearchProgress;
   enrichment: GenerationEnrichmentProgress;
   budget: GenerationBudget;
-}): { canAdvance: boolean; blockedReason: string | null; headline: string } {
+}): {
+  canAdvance: boolean;
+  blockedReason: string | null;
+  headline: string;
+  title: string;
+  displayState: GenerationDisplayState;
+  steps: GenerationStep[];
+  lifecycleComplete: boolean;
+} {
   const { run, search, enrichment, budget } = input;
 
-  if (run.status === "completed") {
-    return { canAdvance: false, blockedReason: null, headline: "Your leads are ready." };
-  }
+  const decide = (
+    displayState: GenerationDisplayState,
+    canAdvance: boolean,
+    headline: string,
+    blockedReason: string | null = null,
+  ) => ({
+    canAdvance,
+    blockedReason,
+    headline,
+    title: TITLES[displayState],
+    displayState,
+    steps: buildSteps({
+      displayState,
+      emailsConsented: enrichment.consented,
+      // Derived from the WORK, not from the display state. A halted run is not
+      // in the "searching" state any more, but that must never be read as the
+      // search having finished -- which is exactly the mistake that would tick
+      // a green check next to an area that was never searched.
+      searchCompleted: search.areasRemaining === 0,
+      emailsCompleted: enrichment.consented && enrichment.remaining === 0,
+    }),
+    lifecycleComplete: displayState === "ready",
+  });
+
+  // ---- terminal states, in the order that matters ----------------------
   if (run.status === "failed") {
-    return {
-      canAdvance: false,
-      blockedReason: "Something went wrong during this generation.",
-      headline: "This generation could not be finished.",
-    };
-  }
-  if (run.status === "stopped") {
-    return {
-      canAdvance: false,
-      blockedReason:
-        run.stop_reason === "generation_call_ceiling"
-          ? "This generation reached its current safety limit."
-          : "This generation was stopped.",
-      headline: "Your leads so far are ready.",
-    };
+    return decide(
+      "failed",
+      false,
+      "This generation could not be finished.",
+      "Something went wrong and the generation could not continue.",
+    );
   }
 
+  if (run.status === "stopped") {
+    // `generation_call_ceiling` is the RETIRED reason from the 30-call gate.
+    // One real run carries it -- the production test that prompted this
+    // redesign, which stopped at 22 calls with 23% of its area searched. It
+    // meant precisely "a spending limit stopped this", so it is read as the
+    // safety stop it was rather than shown as a bare "stopped".
+    if (
+      run.stop_reason === "safety_limit_reached" ||
+      run.stop_reason === "generation_call_ceiling"
+    ) {
+      return decide(
+        "paused-for-safety",
+        false,
+        "Paused before reaching the free-usage limit.",
+        "Your search safety limit was reached before the selected area was fully searched.",
+      );
+    }
+    if (run.stop_reason === "no_progress") {
+      return decide(
+        "failed",
+        false,
+        "This generation stopped making progress.",
+        "The generation stopped making progress and was halted rather than left running.",
+      );
+    }
+    if (run.stop_reason === "blocked") {
+      return decide(
+        "paused-for-safety",
+        false,
+        "This generation could not start.",
+        "The generation was not permitted to start. Nothing was requested and nothing was spent.",
+      );
+    }
+    return decide("stopped", false, "Generation stopped.", "You stopped this generation.");
+  }
+
+  if (run.status === "completed") {
+    // Consent was never given, so email discovery is genuinely still available.
+    // The leads ARE ready; the heading says so and the sub-line is honest about
+    // what was not done rather than quietly implying it was.
+    if (run.stop_reason === "enrichment_not_consented" && enrichment.remaining > 0) {
+      return decide(
+        "ready",
+        false,
+        "Your leads are ready. Email discovery was not part of this generation.",
+      );
+    }
+    return decide("ready", false, "Your leads are ready.");
+  }
+
+  // ---- running ---------------------------------------------------------
   if (run.phase === "ready") {
-    return { canAdvance: false, blockedReason: null, headline: "Your leads are ready." };
+    return decide("preparing", true, "Preparing your results...");
   }
 
   if (run.phase === "searching") {
+    // A hard limit reached mid-flight. Note it STILL ADVANCES: the next advance
+    // is what writes the stop to the database. Returning `canAdvance: false`
+    // here would leave the run marked running forever while also saying it
+    // cannot go on, and the client would stop asking without the reason ever
+    // being recorded.
+    if (budget.exhausted && search.areasRemaining > 0) {
+      return decide("paused-for-safety", true, "Paused before reaching the free-usage limit.");
+    }
     if (search.areasRemaining === 0) {
-      // Nothing left to search: the next advance performs the phase change.
-      return { canAdvance: true, blockedReason: null, headline: "Finishing the search..." };
+      return decide("searching", true, "Finishing the search...");
     }
-    if (budget.exhausted) {
-      return {
-        canAdvance: false,
-        blockedReason: "This generation reached its current safety limit.",
-        headline: "Paused at this generation's safety limit.",
-      };
-    }
-    return { canAdvance: true, blockedReason: null, headline: "Searching local businesses..." };
+    return decide("searching", true, "Searching local businesses...");
   }
 
-  // Email discovery.
-  if (!enrichment.consented) {
-    return {
-      canAdvance: false,
-      blockedReason: "Email discovery was not approved for this generation.",
-      headline: "Your leads are ready. Email discovery is available.",
-    };
+  // ---- email discovery -------------------------------------------------
+  // No consent, or nothing left to check: either way the next advance closes
+  // the run out. Both are "preparing your results" from the user's side.
+  if (!enrichment.consented || enrichment.remaining === 0) {
+    return decide("preparing", true, "Preparing your results...");
   }
-  if (enrichment.remaining === 0) {
-    return { canAdvance: true, blockedReason: null, headline: "Finishing up..." };
-  }
-  return {
-    canAdvance: true,
-    blockedReason: null,
-    headline: "Checking public business websites...",
-  };
+
+  return decide("finding-emails", true, "Checking public business websites...");
+}
+
+/** The page heading for each state. Exactly one of them says "ready". */
+const TITLES: Record<GenerationDisplayState, string> = {
+  searching: "Generating your leads",
+  "finding-emails": "Generating your leads",
+  preparing: "Generating your leads",
+  ready: "Your leads are ready",
+  "paused-for-safety": "Generation paused for safety",
+  stopped: "Generation stopped",
+  failed: "Generation could not be finished",
+};
+
+/**
+ * The three-step flow the processing screen renders.
+ *
+ * A STEP IS ONLY `done` WHEN THE WORK IS DONE. Completion is taken from the
+ * work itself -- areas owed, leads still to check -- and never inferred from
+ * the display state, because a halted run has left the "searching" state
+ * without having finished searching. Inferring it would put a green check next
+ * to an area that was never searched, which is the same class of lie as
+ * "your leads are ready" over 23% coverage.
+ *
+ * `blocked` is used rather than `pending` for work that will not now happen, so
+ * a stopped run never looks like it is still waiting its turn.
+ */
+function buildSteps(input: {
+  displayState: GenerationDisplayState;
+  emailsConsented: boolean;
+  searchCompleted: boolean;
+  emailsCompleted: boolean;
+}): GenerationStep[] {
+  const { displayState, emailsConsented, searchCompleted, emailsCompleted } = input;
+
+  const halted =
+    displayState === "paused-for-safety" || displayState === "stopped" || displayState === "failed";
+
+  return [
+    {
+      id: "search",
+      label: "Searching businesses",
+      state: searchCompleted ? "done" : halted ? "blocked" : "active",
+    },
+    {
+      id: "emails",
+      label: "Finding business emails",
+      state: !emailsConsented
+        ? "blocked"
+        : emailsCompleted
+          ? "done"
+          : halted
+            ? "blocked"
+            : searchCompleted
+              ? "active"
+              : "pending",
+    },
+    {
+      id: "results",
+      label: "Preparing your results",
+      state:
+        displayState === "ready"
+          ? "done"
+          : halted
+            ? "blocked"
+            : searchCompleted && emailsCompleted
+              ? "active"
+              : "pending",
+    },
+  ];
 }
