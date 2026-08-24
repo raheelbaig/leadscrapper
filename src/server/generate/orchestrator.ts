@@ -640,6 +640,56 @@ async function enterEnrichmentPhase(
   });
 }
 
+/**
+ * The lease was not granted. Decide whether that means "wait" or "stop".
+ *
+ * `claim_search_job_by_id` returns no row for two reasons that look identical
+ * to the caller and mean opposite things:
+ *
+ *   A LIVE LEASE IS HELD -- another slice is working RIGHT NOW. Losing this
+ *   race is not a failure and not even a delay in the work: the search is
+ *   progressing under the other lease. The correct response is to leave the run
+ *   exactly as it is and let the client ask again. Crucially it must NOT count
+ *   as a no-progress advance -- a 50-second slice would otherwise let a
+ *   remounted client burn the entire liveness budget in a couple of seconds and
+ *   halt a perfectly healthy run.
+ *
+ *   THE SEARCH IS NOT RUNNABLE -- its status is not `queued` or `running`, so
+ *   no amount of asking will change anything. That IS terminal, and gets an
+ *   honest reason rather than a retry loop.
+ *
+ * One SELECT distinguishes them, and it is worth it: getting this wrong is what
+ * recorded a 357-lead run as unrecoverable while it was still collecting leads.
+ */
+async function handleClaimFailure(
+  db: AdminDb,
+  run: GenerationRunRow,
+  now: () => number,
+): Promise<GenerationState> {
+  const { data: search } = await db
+    .from("searches")
+    .select("status, locked_by, heartbeat_at")
+    .eq("id", run.search_id)
+    .maybeSingle();
+
+  const runnable = search?.status === "queued" || search?.status === "running";
+  const leaseHeld = Boolean(search?.locked_by);
+
+  if (runnable && leaseHeld) {
+    // Someone is working. Nothing to record, nothing to count, nothing to stop.
+    return buildGenerationState(db, run, now);
+  }
+
+  // Not runnable: the search finished, was cancelled, or is in a state this run
+  // cannot drive. Ending honestly beats asking forever.
+  const stopped = await finishRun(db, run, "search_unavailable", now, {
+    status: "stopped",
+    lastError: `The search is ${search?.status ?? "unavailable"} and cannot be continued by this generation.`,
+  });
+
+  return buildGenerationState(db, stopped, now);
+}
+
 async function handleAdvanceError(
   db: AdminDb,
   run: GenerationRunRow,
@@ -658,13 +708,11 @@ async function handleAdvanceError(
     return buildGenerationState(db, stopped, now);
   }
 
-  // Another runner holds the lease. Transient by nature, so the run stays
-  // running and the client simply asks again -- but it counts as an advance
-  // that changed nothing, so a lease that never frees up ends the run through
-  // the liveness guard instead of being retried forever.
+  // The lease could not be taken. `claim_search_job_by_id` returns no row for
+  // two very different reasons, and telling them apart is the whole fix for the
+  // production failure of 2026-08-23.
   if (error instanceof ClaimError) {
-    const stalled = await trackProgress(db, run, false, now);
-    return buildGenerationState(db, stalled ?? run, now);
+    return handleClaimFailure(db, run, now);
   }
 
   const message = error instanceof Error ? error.message : String(error);

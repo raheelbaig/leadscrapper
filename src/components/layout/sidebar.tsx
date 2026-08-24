@@ -20,8 +20,7 @@ export function SidebarNav({ onNavigate }: { onNavigate?: () => void }) {
             {section.label}
           </p>
           {section.items.map((item) => {
-            const active =
-              pathname === item.href || pathname.startsWith(`${item.href}/`);
+            const active = pathname === item.href || pathname.startsWith(`${item.href}/`);
             const Icon = item.icon;
 
             return (
@@ -65,7 +64,7 @@ export function Sidebar() {
 
       <div className="px-3 pt-4">
         <Link
-          href="/find-leads"
+          href="/generate"
           className={cn(buttonVariants({ size: "lg" }), "w-full justify-center gap-2")}
         >
           <Plus className="size-4" />

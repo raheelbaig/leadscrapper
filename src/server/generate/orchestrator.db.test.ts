@@ -90,23 +90,63 @@ describe.skipIf(!ENABLED)("guided generation orchestration", () => {
     // So cleanup keys off the fixture marker instead. `city = 'Fixtureville'`
     // and a `Guided Fixture` niche cannot match anything real, which makes this
     // safe to run unconditionally and makes a partial failure self-healing.
-    const { data: strays } = await db
-      .from("searches")
-      .select("id")
-      .eq("user_id", userId)
-      .eq("city", "Fixtureville")
-      .like("niche", "Guided Fixture%");
+    // AND RETRIED, because a single pass is not enough against a shared hosted
+    // database. Under load this project starts returning `{ data: null }`
+    // without an error, and a cleanup written as one straight-line pass reads
+    // that as "nothing to delete" and exits satisfied. It happened: a throttled
+    // run left twelve fixture searches and 110 fixture leads behind.
+    //
+    // Everything here is therefore retried until it genuinely succeeds, and the
+    // sweep is keyed off the fixture marker rather than the collected ids so a
+    // partially-failed run still cleans up after itself.
+    const strays = await withRetry("list fixtures", () =>
+      db
+        .from("searches")
+        .select("id")
+        .eq("user_id", userId)
+        .eq("city", "Fixtureville")
+        .like("niche", "Guided Fixture%"),
+    );
 
     const ids = new Set([...createdSearchIds, ...(strays ?? []).map((row) => row.id)]);
 
     // Order matters: leads hang off the search, and generation runs cascade
     // with it.
     for (const searchId of ids) {
-      await db.from("leads").delete().eq("search_id", searchId);
-      await db.from("generation_runs").delete().eq("search_id", searchId);
-      await db.from("searches").delete().eq("id", searchId);
+      await withRetry("leads", () =>
+        db.from("leads").delete().eq("search_id", searchId).select("id"),
+      );
+      await withRetry("runs", () =>
+        db.from("generation_runs").delete().eq("search_id", searchId).select("id"),
+      );
+      await withRetry("search", () => db.from("searches").delete().eq("id", searchId).select("id"));
     }
   });
+
+  /**
+   * Runs a query until it actually answers.
+   *
+   * A transient `{ data: null, error: null }` from an overloaded project is
+   * indistinguishable from an empty result at the call site, and treating it as
+   * empty is what leaks fixtures into a shared database. Six attempts with
+   * increasing backoff is ample for a hiccup and still bounded.
+   */
+  async function withRetry<T>(
+    label: string,
+    run: () => PromiseLike<{ data: T | null; error: { message: string } | null }>,
+    attempts = 6,
+  ): Promise<T | null> {
+    let lastError = "";
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const { data, error } = await run();
+      if (!error && data !== null) return data;
+      lastError = error?.message ?? "null data with no error";
+      await new Promise((resolve) => setTimeout(resolve, attempt * 750));
+    }
+    // Loud rather than silent: a fixture left in a shared project is worse than
+    // a failing hook, because the next run inherits it.
+    throw new Error(`Fixture cleanup could not complete (${label}): ${lastError}`);
+  }
 
   // -------------------------------------------------------------------------
   // Fakes
@@ -740,6 +780,138 @@ describe.skipIf(!ENABLED)("guided generation orchestration", () => {
       perLead.set(attempt.lead_id, (perLead.get(attempt.lead_id) ?? 0) + 1);
     }
     for (const count of perLead.values()) expect(count).toBe(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // Lease contention — the production failure of 2026-08-23
+  // -------------------------------------------------------------------------
+
+  /**
+   * THE REGRESSION TEST FOR generation 2d3aacec.
+   *
+   * Two advances overlapped, the second lost the race for the lease, and the
+   * run was recorded `failed` while the first was still working -- it went on
+   * to collect 357 leads the UI had already declared unreachable.
+   *
+   * Losing a race must leave the generation exactly as it was.
+   */
+  it("treats losing the race for the lease as transient, not as a failure", async () => {
+    const created = await createRun({ enrichEmails: true, testBbox: LARGE_BOX });
+
+    // Do one real slice first, so there is progress worth preserving.
+    await orchestrator.advanceGenerationRun(
+      { runId: created.runId, userId },
+      { runTick: makeTickFake({ asked: [] }), runEnrichment: makeEnrichmentFake({ calls: 0 }) },
+    );
+    const before = await stateModule.loadGenerationState({ runId: created.runId, userId });
+    expect(before.search.leadsFound).toBeGreaterThan(0);
+
+    // Someone else is mid-slice: the search is running and holds a live lease.
+    await db
+      .from("searches")
+      .update({
+        status: "running",
+        locked_by: "11111111-1111-1111-1111-111111111111",
+        locked_at: new Date().toISOString(),
+        heartbeat_at: new Date().toISOString(),
+      })
+      .eq("id", created.searchId);
+
+    // The REAL claim path, not a fake -- this is what threw the plain Error.
+    const contended = await orchestrator.advanceGenerationRun(
+      { runId: created.runId, userId },
+      { runEnrichment: makeEnrichmentFake({ calls: 0 }) },
+    );
+
+    expect(contended.status).toBe("running");
+    expect(contended.stopReason).toBeNull();
+    expect(contended.canAdvance).toBe(true);
+    // Nothing collected was lost or disowned.
+    expect(contended.search.leadsFound).toBe(before.search.leadsFound);
+
+    // AND IT MUST NOT BURN THE LIVENESS BUDGET. A 50-second slice would
+    // otherwise let a remounted client halt a healthy run in a couple of
+    // seconds.
+    const { data: row } = await db
+      .from("generation_runs")
+      .select("no_progress_ticks, status")
+      .eq("id", created.runId)
+      .single();
+    expect(row!.no_progress_ticks).toBe(0);
+    expect(row!.status).toBe("running");
+
+    // Repeated contention still never fails the run.
+    for (let i = 0; i < GENERATION_LIMITS.maxNoProgressAdvances + 2; i += 1) {
+      await orchestrator.advanceGenerationRun(
+        { runId: created.runId, userId },
+        { runEnrichment: makeEnrichmentFake({ calls: 0 }) },
+      );
+    }
+    const after = await stateModule.loadGenerationState({ runId: created.runId, userId });
+    expect(after.status).toBe("running");
+    expect(after.stopReason).toBeNull();
+
+    // Release the lease so cleanup and later cases are unaffected.
+    await db
+      .from("searches")
+      .update({ status: "paused", locked_by: null, locked_at: null })
+      .eq("id", created.searchId);
+  });
+
+  it("resumes normally once the lease is free again", async () => {
+    const created = await createRun({ enrichEmails: false, testBbox: LARGE_BOX });
+
+    await db
+      .from("searches")
+      .update({
+        status: "running",
+        locked_by: "22222222-2222-2222-2222-222222222222",
+        locked_at: new Date().toISOString(),
+        heartbeat_at: new Date().toISOString(),
+      })
+      .eq("id", created.searchId);
+
+    const blocked = await orchestrator.advanceGenerationRun(
+      { runId: created.runId, userId },
+      { runEnrichment: makeEnrichmentFake({ calls: 0 }) },
+    );
+    expect(blocked.status).toBe("running");
+
+    // The other runner finishes and lets go.
+    await db
+      .from("searches")
+      .update({ status: "paused", locked_by: null, locked_at: null })
+      .eq("id", created.searchId);
+
+    const resumed = await orchestrator.advanceGenerationRun(
+      { runId: created.runId, userId },
+      { runTick: makeTickFake({ asked: [] }), runEnrichment: makeEnrichmentFake({ calls: 0 }) },
+    );
+
+    // Straight back to work, with no intervention and no new approval.
+    expect(resumed.status).toBe("running");
+    expect(resumed.search.leadsFound).toBeGreaterThan(0);
+  });
+
+  /**
+   * The OTHER reason the claim returns no row: the search cannot be driven at
+   * all. That is genuinely terminal and must not become an infinite retry.
+   */
+  it("stops honestly when the search is no longer runnable", async () => {
+    const created = await createRun({ enrichEmails: false, testBbox: LARGE_BOX });
+
+    await db.from("searches").update({ status: "canceled" }).eq("id", created.searchId);
+
+    const state = await orchestrator.advanceGenerationRun(
+      { runId: created.runId, userId },
+      { runEnrichment: makeEnrichmentFake({ calls: 0 }) },
+    );
+
+    expect(state.status).toBe("stopped");
+    expect(state.stopReason).toBe("search_unavailable");
+    expect(state.canAdvance).toBe(false);
+    // Not dressed up as a crash.
+    expect(state.title).toBe("Generation stopped");
   });
 
   it("resets the liveness counter when real progress happens", async () => {

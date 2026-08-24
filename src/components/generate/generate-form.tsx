@@ -7,7 +7,6 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { DEFAULT_GRID_CONFIG, INITIAL_AVG_PAGES_PER_TILE } from "@/lib/constants";
@@ -24,27 +23,29 @@ import { createGenerationSchema } from "@/lib/schemas/generate";
 import { cn } from "@/lib/utils";
 
 /**
- * The one form in the product's normal path.
+ * The first screen of the product, and for most sessions the only one that
+ * needs a decision.
  *
- * Four questions -- what, where, how many, and may we check their websites --
- * and one button. Everything that used to require walking Find Leads ->
- * Searches -> Run -> Enrichment -> Exports happens after the press.
+ * ONE CARD, FIVE QUESTIONS, ONE BUTTON. This was five stacked cards with their
+ * own headings, which read as a five-step configuration wizard for what is
+ * really a short form. Nothing was removed -- every input is still here -- but
+ * the scaffolding around them is gone.
  *
- * ONE PRESS APPROVES THE WHOLE JOB. There is no second approval to press
- * through: the generation searches, deduplicates, checks websites for emails
- * and prepares the file, then stops on its own.
+ * EMAIL DISCOVERY IS NO LONGER A CHOICE. It used to be a checkbox; it is now
+ * simply part of what Generate Leads means, stated in the sentence under the
+ * button. The consent is still recorded as a timestamp on the run, and the
+ * orchestrator still refuses to reach a single website without it -- what
+ * changed is that the user is told plainly instead of being asked to opt in to
+ * the thing they came for.
  *
- * WHAT THE USER APPROVES IS ON SCREEN BEFORE THEY PRESS. The summary states the
- * estimate, the HARD maximum this run can ever spend, the protected quota
- * remaining, and -- when the area is large enough that the limit will bind
- * first -- that it will stop partway and say which area it did not reach. The
- * numbers are computed with the SAME pure functions the server plans with
+ * USAGE STAYS VISIBLE WITHOUT A PAGE OF ITS OWN. Two figures in the user's
+ * terms: what this run may spend and what the month has left. SKUs, reserves
+ * and quota mechanics live under Technical details.
+ *
+ * The estimate is computed with the SAME pure functions the server plans with
  * (`gridDimensions`, `bboxAreaKm2`), so this preview cannot promise a grid the
- * server would build differently.
- *
- * Validation uses the SHARED schema. The browser is not trusted with any of it:
- * the server re-validates, re-derives the grid, and reads the call ceiling from
- * its own constant rather than from anything sent here.
+ * server would build differently. Validation uses the SHARED schema, and the
+ * server re-validates everything and reads its own limits regardless.
  */
 
 type Quota = { used: number; freeLimit: number; remaining: number };
@@ -55,8 +56,7 @@ type Quota = { used: number; freeLimit: number; remaining: number };
  * Native on purpose. The area picker is three dependent lists whose options
  * change as the ones above them change, and the browser's own control handles
  * that -- plus keyboard, touch and screen-reader behaviour -- without a
- * controlled-popover dance. Styled to sit alongside `Input` so it reads as part
- * of the same design system.
+ * controlled-popover dance.
  */
 function FieldSelect({ className, ...props }: React.SelectHTMLAttributes<HTMLSelectElement>) {
   return (
@@ -95,8 +95,7 @@ export function GenerateForm({
   const [state, setState] = useState(states[0] ?? "");
   const options = useMemo(() => areasIn(areas, country, state), [areas, country, state]);
   const [areaId, setAreaId] = useState(options[0] ? areaOptionId(options[0]) : "");
-  const [targetLeads, setTargetLeads] = useState("40");
-  const [enrichEmails, setEnrichEmails] = useState(true);
+  const [targetLeads, setTargetLeads] = useState("100");
 
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -135,9 +134,9 @@ export function GenerateForm({
         areaKm2: bboxAreaKm2(selected.bbox),
         areas: grid.tileCount,
         estimatedCalls,
-        /** The number being approved: never more than this press permits. */
+        /** Never more than this run may spend. */
         guaranteedMax: Math.min(callCeiling, quota.remaining),
-        needsSeveralApprovals: estimatedCalls > callCeiling,
+        largerThanOneRun: estimatedCalls > callCeiling,
       };
     } catch {
       return null;
@@ -155,7 +154,9 @@ export function GenerateForm({
       city: selected.city,
       customAreaId: selected.customAreaId ?? undefined,
       targetLeads,
-      enrichEmails,
+      // Email discovery is part of what Generate Leads means. The server still
+      // records the consent and still gates every external request on it.
+      enrichEmails: true,
     };
 
     const parsed = createGenerationSchema.safeParse(candidate);
@@ -182,8 +183,6 @@ export function GenerateForm({
         return;
       }
 
-      // Straight to the processing screen. No Searches list, no second Run
-      // press, no manual Enrichment step.
       router.push(`/generate/${payload.runId}`);
     } catch (error) {
       toast.error("We could not start this generation", {
@@ -200,191 +199,88 @@ export function GenerateForm({
     <form onSubmit={submit} className="space-y-4">
       <Card>
         <CardHeader>
-          <CardTitle>What are you looking for?</CardTitle>
+          <CardTitle className="text-lg">Find local businesses</CardTitle>
           <CardDescription>
-            The kind of business, without the location — the area is handled below.
+            Tell us what you are looking for and where, and we will do the rest.
           </CardDescription>
         </CardHeader>
-        <CardContent className="space-y-2">
-          <Label htmlFor="niche">Business niche</Label>
-          <Input
-            id="niche"
-            value={niche}
-            onChange={(event) => setNiche(event.target.value)}
-            placeholder="Embroidery Shops"
-            autoFocus
-          />
-          <FieldError message={errors.niche} />
-        </CardContent>
-      </Card>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Where?</CardTitle>
-          <CardDescription>
-            Choose one of the areas we have boundaries for, or an area you saved earlier.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="grid gap-4 sm:grid-cols-3">
+        <CardContent className="space-y-5">
           <div className="space-y-2">
-            <Label htmlFor="country">Country</Label>
-            <FieldSelect
-              id="country"
-              value={country}
-              onChange={(event) => onCountryChange(event.target.value)}
-            >
-              {countries.map((item) => (
-                <option key={item} value={item}>
-                  {item}
-                </option>
-              ))}
-            </FieldSelect>
-          </div>
-
-          <div className="space-y-2">
-            <Label htmlFor="state">State / region</Label>
-            <FieldSelect
-              id="state"
-              value={state}
-              onChange={(event) => onStateChange(event.target.value)}
-            >
-              {states.map((item) => (
-                <option key={item} value={item}>
-                  {item === "" ? "—" : item}
-                </option>
-              ))}
-            </FieldSelect>
-          </div>
-
-          <div className="space-y-2">
-            <Label htmlFor="area">City / saved area</Label>
-            <FieldSelect
-              id="area"
-              value={areaId}
-              onChange={(event) => setAreaId(event.target.value)}
-            >
-              {options.map((option) => (
-                <option key={areaOptionId(option)} value={areaOptionId(option)}>
-                  {option.name}
-                  {option.kind === "custom" ? " (saved area)" : ""}
-                </option>
-              ))}
-            </FieldSelect>
-          </div>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>How many leads?</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-2">
-          <Label htmlFor="target">Target leads</Label>
-          <Input
-            id="target"
-            inputMode="numeric"
-            value={targetLeads}
-            onChange={(event) => setTargetLeads(event.target.value)}
-            className="max-w-[10rem]"
-          />
-          <p className="text-muted-foreground text-xs">
-            This is a minimum target, not a hard limit. We may find more — the search finishes when
-            the area has been covered, not when this number is reached.
-          </p>
-          <FieldError message={errors.targetLeads} />
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Business emails</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <label className="flex cursor-pointer items-start gap-3">
-            <Checkbox
-              checked={enrichEmails}
-              onCheckedChange={(checked) => setEnrichEmails(checked === true)}
-              className="mt-0.5"
+            <Label htmlFor="niche">Business niche</Label>
+            <Input
+              id="niche"
+              value={niche}
+              onChange={(event) => setNiche(event.target.value)}
+              placeholder="Embroidery Shops"
+              autoFocus
             />
-            <span className="space-y-1">
-              <span className="block text-sm font-medium">
-                Check public business websites for contact emails
-              </span>
-              <span className="text-muted-foreground block text-xs">
-                Google never returns an email address, so we visit each business&rsquo;s own website
-                and look. We read their robots.txt first and check at most a handful of pages per
-                business, one business at a time.
-              </span>
-            </span>
-          </label>
-        </CardContent>
-      </Card>
+            <FieldError message={errors.niche} />
+          </div>
 
-      {/* ---------------- Pre-flight ---------------- */}
-      <Card className="border-primary/30 bg-primary/[0.03]">
-        <CardHeader>
-          <CardTitle>Ready to generate</CardTitle>
-          <CardDescription>What this one press approves.</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div>
-            <p className="text-base font-semibold">{niche.trim() || "Your niche"}</p>
-            <p className="text-muted-foreground text-sm">
-              {selected
-                ? [selected.name, selected.state, selected.country].filter(Boolean).join(", ")
-                : "No area selected"}
+          <div className="grid gap-4 sm:grid-cols-3">
+            <div className="space-y-2">
+              <Label htmlFor="country">Country</Label>
+              <FieldSelect
+                id="country"
+                value={country}
+                onChange={(event) => onCountryChange(event.target.value)}
+              >
+                {countries.map((item) => (
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
+                ))}
+              </FieldSelect>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="state">State / region</Label>
+              <FieldSelect
+                id="state"
+                value={state}
+                onChange={(event) => onStateChange(event.target.value)}
+              >
+                {states.map((item) => (
+                  <option key={item} value={item}>
+                    {item === "" ? "—" : item}
+                  </option>
+                ))}
+              </FieldSelect>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="area">City / area</Label>
+              <FieldSelect
+                id="area"
+                value={areaId}
+                onChange={(event) => setAreaId(event.target.value)}
+              >
+                {options.map((option) => (
+                  <option key={areaOptionId(option)} value={areaOptionId(option)}>
+                    {option.name}
+                    {option.kind === "custom" ? " (saved area)" : ""}
+                  </option>
+                ))}
+              </FieldSelect>
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="target">Target leads</Label>
+            <Input
+              id="target"
+              inputMode="numeric"
+              value={targetLeads}
+              onChange={(event) => setTargetLeads(event.target.value)}
+              className="max-w-40"
+            />
+            <p className="text-muted-foreground text-xs">
+              A minimum, not a limit. We keep going until the whole area has been searched, so you
+              may well get more.
             </p>
+            <FieldError message={errors.targetLeads} />
           </div>
-
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            <Figure label="Minimum leads" value={formatNumber(Number(targetLeads) || 0)} />
-            <Figure
-              label="Estimated Google requests"
-              value={plan ? `~${formatNumber(plan.estimatedCalls)}` : "—"}
-              hint={plan ? `${formatNumber(plan.areas)} areas to search` : undefined}
-            />
-            <Figure
-              label="Hard maximum"
-              value={plan ? formatNumber(plan.guaranteedMax) : formatNumber(callCeiling)}
-              hint="this run can never exceed it"
-              emphasis
-            />
-            <Figure
-              label="Protected quota remaining"
-              value={formatNumber(quota.remaining)}
-              hint={`${formatNumber(quota.used)} of ${formatNumber(quota.freeLimit)} used this month`}
-            />
-          </div>
-
-          {/*
-           * ONE PRESS APPROVES THE WHOLE JOB, so the number that matters is the
-           * hard maximum rather than a slice size -- and the user is told what
-           * happens if the area turns out to need more than that, rather than
-           * discovering it as a button they have to keep pressing.
-           */}
-          <p className="text-muted-foreground text-xs">
-            This one press runs the whole job: searching, removing duplicates, checking websites for
-            emails, and preparing your file. It stops on its own when the area has been covered — or
-            sooner if it reaches the {formatNumber(plan?.guaranteedMax ?? callCeiling)}-request
-            safety limit, which it will tell you about plainly. It never enters paid usage.
-          </p>
-
-          {plan?.needsSeveralApprovals ? (
-            <p className="rounded-lg border border-amber-500/40 bg-amber-500/5 p-3 text-xs text-amber-700 dark:text-amber-400">
-              This area is large — covering it completely is likely to take about{" "}
-              {formatNumber(plan.estimatedCalls)} requests, more than the{" "}
-              {formatNumber(plan.guaranteedMax)} this run may make. Expect it to stop partway with
-              the area it did not reach listed for you. Nothing is spent beyond the limit.
-            </p>
-          ) : null}
-
-          <p className="text-muted-foreground text-xs">
-            Email enrichment:{" "}
-            <span className="text-foreground font-medium">{enrichEmails ? "ON" : "OFF"}</span>
-            {enrichEmails
-              ? " — we will check the websites of the businesses we find."
-              : " — we will collect businesses only."}
-          </p>
 
           <Button
             type="submit"
@@ -400,33 +296,53 @@ export function GenerateForm({
             {blocked ? "Monthly capacity reached" : submitting ? "Starting…" : "Generate Leads"}
           </Button>
 
+          <p className="text-muted-foreground text-sm">
+            We&rsquo;ll find businesses in your selected area, collect their public business
+            information, and automatically look for public contact emails.
+          </p>
+
           {blocked ? (
             <p className="text-xs text-red-600 dark:text-red-400">
               Your free monthly Google search capacity has been reached. Nothing will be requested
-              until the billing month resets.
+              until it resets.
             </p>
           ) : null}
         </CardContent>
       </Card>
 
-      {/* ---------------- What happens next ---------------- */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-sm">What happens after you press Generate Leads?</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <ol className="text-muted-foreground list-decimal space-y-1.5 pl-4 text-sm">
-            <li>We search businesses across your selected area, section by section.</li>
-            <li>
-              We remove duplicates, within this search and against everything you have found before.
-            </li>
-            <li>We check public business websites for contact emails.</li>
-            <li>We prepare your Excel file.</li>
-          </ol>
-        </CardContent>
-      </Card>
+      <div className="text-muted-foreground flex flex-wrap items-center gap-x-6 gap-y-1 px-1 text-xs">
+        <span>
+          This search may use up to{" "}
+          <span className="text-foreground font-semibold tabular-nums">
+            {formatNumber(plan?.guaranteedMax ?? callCeiling)}
+          </span>{" "}
+          Google requests
+        </span>
+        <span>
+          Monthly usage{" "}
+          <span className="text-foreground font-semibold tabular-nums">
+            {formatNumber(quota.used)} / {formatNumber(quota.freeLimit)}
+          </span>
+        </span>
+        {plan ? (
+          <span>
+            Estimated for this area{" "}
+            <span className="text-foreground font-semibold tabular-nums">
+              ~{formatNumber(plan.estimatedCalls)}
+            </span>
+          </span>
+        ) : null}
+      </div>
 
-      {/* ---------------- Advanced ---------------- */}
+      {plan?.largerThanOneRun ? (
+        <p className="rounded-lg border border-amber-500/40 bg-amber-500/5 p-3 text-xs text-amber-700 dark:text-amber-400">
+          This area is large. Covering it completely is likely to take about{" "}
+          {formatNumber(plan.estimatedCalls)} requests, more than the{" "}
+          {formatNumber(plan.guaranteedMax)} this search may make, so expect it to stop partway and
+          tell you which area it did not reach. Nothing is spent beyond the limit.
+        </p>
+      ) : null}
+
       <div>
         <button
           type="button"
@@ -436,7 +352,7 @@ export function GenerateForm({
           <ChevronDown
             className={cn("size-3.5 transition-transform", showAdvanced && "rotate-180")}
           />
-          Advanced / technical details
+          Technical details
         </button>
 
         {showAdvanced ? (
@@ -448,46 +364,19 @@ export function GenerateForm({
               list offers the areas we already have boundaries for, plus any you have saved.
             </p>
             <p>
-              To search somewhere else, draw the area once under{" "}
-              <a href="/settings" className="text-foreground underline">
-                Settings
-              </a>{" "}
-              and it will appear in this list as a saved area.
+              Only free Google usage is ever made. {formatNumber(quota.remaining)} request(s) remain
+              in this month&rsquo;s protected allowance, and a run stops rather than going past it.
             </p>
             {plan && selected ? (
               <p>
-                Selected rectangle: {plan.areaKm2.toFixed(0)} km², tiled into {plan.areas} sections
-                at a {DEFAULT_GRID_CONFIG.seedTileEdgeKm} km seed edge. Section count follows from
-                the rectangle alone — the lead target has no influence on it.
+                Selected rectangle: {plan.areaKm2.toFixed(0)} km², divided into {plan.areas}{" "}
+                sections at a {DEFAULT_GRID_CONFIG.seedTileEdgeKm} km edge. Section count follows
+                from the rectangle alone — the lead target has no influence on it.
               </p>
             ) : null}
           </div>
         ) : null}
       </div>
     </form>
-  );
-}
-
-function Figure({
-  label,
-  value,
-  hint,
-  emphasis,
-}: {
-  label: string;
-  value: string;
-  hint?: string;
-  emphasis?: boolean;
-}) {
-  return (
-    <div className="space-y-0.5">
-      <p className="text-muted-foreground text-[11px] font-medium tracking-wide uppercase">
-        {label}
-      </p>
-      <p className={cn("text-base font-semibold tabular-nums", emphasis && "text-primary")}>
-        {value}
-      </p>
-      {hint ? <p className="text-muted-foreground text-[11px]">{hint}</p> : null}
-    </div>
   );
 }

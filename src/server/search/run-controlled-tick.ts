@@ -11,7 +11,7 @@ import { getSupabaseAdminClient } from "@/server/db/admin";
 import type { PlacesApiError } from "@/server/places/errors";
 import { mapPlaces } from "@/server/places/lead-mapper";
 
-import { claimSearchById } from "./claim";
+import { ClaimError, claimSearchById } from "./claim";
 import { classifyTile, type TileClassification } from "./classify-tile";
 import {
   finalOutcome,
@@ -270,7 +270,21 @@ export async function runControlledTick(
   if (!claimedRow) {
     // Someone else holds a live lease, or the search is not runnable. Never
     // proceed without the lease -- that is the double-billing guard.
-    throw new Error(
+    //
+    // THROWN AS A `ClaimError`, and the type matters.
+    //
+    // This used to be a bare `Error`. `ClaimError` was reserved for the RPC
+    // itself failing, so the COMMON case -- losing a race for the lease -- did
+    // not carry the type its handlers test for. A caller written to treat
+    // contention as transient could not recognise it, fell through to its
+    // catch-all, and marked a whole generation permanently failed. That is
+    // exactly what happened to generation 2d3aacec on 2026-08-23: two advances
+    // overlapped, the second lost the race, and a run that went on to collect
+    // 357 leads was recorded as unrecoverable while the first was still
+    // working.
+    //
+    // Losing a race is not a failure. The type now says so.
+    throw new ClaimError(
       "This search is already running, or is not in a runnable state. Wait for the current run to finish.",
     );
   }

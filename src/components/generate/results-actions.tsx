@@ -44,7 +44,7 @@ export function ExportExcelButton({
       }
 
       setExportId(payload.exportId);
-      toast.success("Excel exported successfully.", {
+      toast.success("Excel file is ready.", {
         description: payload.partialCoverage
           ? `${formatNumber(payload.rowCount)} leads. Only ${formatPercent(payload.coveragePct, 1)} of the area was searched — the Coverage sheet inside the file names every section that was not.`
           : `${formatNumber(payload.rowCount)} leads. The whole area was searched.`,

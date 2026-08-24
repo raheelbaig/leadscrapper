@@ -398,6 +398,15 @@ export function describeRun(input: {
         "The generation was not permitted to start. Nothing was requested and nothing was spent.",
       );
     }
+    if (run.stop_reason === "search_unavailable") {
+      // Not a failure of the work -- everything collected is real and kept.
+      return decide(
+        "stopped",
+        false,
+        "Generation stopped.",
+        "This search can no longer be continued by this generation. Everything it collected is kept.",
+      );
+    }
     return decide("stopped", false, "Generation stopped.", "You stopped this generation.");
   }
 

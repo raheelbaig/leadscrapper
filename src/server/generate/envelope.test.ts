@@ -252,10 +252,16 @@ describe("the one-click lifecycle", () => {
 
   it("takes the results heading from the server rather than composing one", () => {
     const page = code(RESULTS_PAGE);
-    // The heading is a server conclusion about coverage and email progress.
-    expect(page).toMatch(/title=\{state\.title\}/);
-    // And the page never hard-codes the success wording itself.
+
+    // A success heading is only ever reachable through `lifecycleComplete`,
+    // which the server computes from coverage and email progress. Every other
+    // state falls back to the server's own title, so no incomplete run can be
+    // headed as though it finished.
+    expect(page).toMatch(/title=\{state\.lifecycleComplete \? "Your Leads" : state\.title\}/);
+
+    // And the page never decides on its own that a run succeeded.
     expect(page).not.toMatch(/"Your leads are ready"/);
+    expect(page).not.toMatch(/fullyCovered \?[^:]*"Your/);
   });
 
   it("keeps the manual Continue action out of the primary flow", () => {
@@ -301,5 +307,73 @@ describe("the one-click lifecycle", () => {
     // No budget arithmetic, no tile counting, no batch sizing in the browser.
     expect(view).not.toMatch(/maxTilesPerTick|areasAllowed|callsUsed|enrichmentLeadsPerAdvance/);
     expect(view).not.toMatch(/SEARCH_LIMITS|GENERATION_LIMITS/);
+  });
+});
+
+describe("lease contention is transient, not terminal", () => {
+  /**
+   * THE REGRESSION GUARD FOR generation 2d3aacec.
+   *
+   * The tick runner used to throw a bare `Error` when the claim returned no
+   * row, so the handler written to treat contention as transient could not
+   * recognise the case it existed for. A run that went on to collect 357 leads
+   * was recorded as unrecoverable. The TYPE is the fix, so the type is pinned.
+   */
+  it("throws a typed ClaimError when the lease is not granted", () => {
+    const runner = read("src/server/search/run-controlled-tick.ts");
+
+    const claimBlock = runner.slice(
+      runner.indexOf("if (!claimedRow)"),
+      runner.indexOf("const startedAt = now()"),
+    );
+
+    expect(claimBlock).toMatch(/throw new ClaimError\(/);
+    // Specifically NOT a bare Error, which is what broke it.
+    expect(claimBlock).not.toMatch(/throw new Error\(/);
+    expect(runner).toMatch(/import \{ ClaimError, claimSearchById \}/);
+  });
+
+  it("routes a claim failure away from the generic failure path", () => {
+    const orchestrator = read("src/server/generate/orchestrator.ts");
+
+    // Contention gets its own handler, which distinguishes "someone is working"
+    // from "this search cannot be driven".
+    expect(orchestrator).toMatch(
+      /if \(error instanceof ClaimError\) \{\s*return handleClaimFailure/,
+    );
+    expect(orchestrator).toMatch(/async function handleClaimFailure/);
+    expect(orchestrator).toMatch(/search_unavailable/);
+  });
+
+  it("does not count contention against the liveness budget", () => {
+    const orchestrator = read("src/server/generate/orchestrator.ts");
+    const handler = orchestrator.slice(
+      orchestrator.indexOf("async function handleClaimFailure"),
+      orchestrator.indexOf("async function handleAdvanceError"),
+    );
+
+    // A 50-second slice would otherwise let a remounted client halt a healthy
+    // run in seconds.
+    expect(handler).not.toMatch(/trackProgress/);
+  });
+});
+
+describe("the client cannot overlap advances", () => {
+  it("guards in-flight advances at module scope, not in a ref", () => {
+    const client = read("src/lib/generate/advance-client.ts");
+    const view = read("src/components/generate/processing-view.tsx");
+
+    // The registry outlives any component, which is what a remount defeats.
+    expect(client).toMatch(/const inFlight = new Map</);
+    // And the screen no longer keeps its own guard to reset on cleanup.
+    expect(view).toMatch(/requestAdvance\(runId\)/);
+    expect(view).not.toMatch(/inFlight\.current/);
+  });
+
+  it("shares the request rather than waiting out a delay", () => {
+    const client = read("src/lib/generate/advance-client.ts");
+    // No timers anywhere: correctness comes from sharing the promise.
+    expect(client).not.toMatch(/setTimeout|setInterval/);
+    expect(read("src/components/generate/processing-view.tsx")).not.toMatch(/ADVANCE_GAP_MS/);
   });
 });

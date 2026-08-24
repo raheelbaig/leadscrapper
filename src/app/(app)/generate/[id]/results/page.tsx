@@ -1,4 +1,4 @@
-import { CheckCircle2, Gauge, Mail, MailX, Percent, ShieldAlert, Users } from "lucide-react";
+import { CheckCircle2, Gauge, Mail, Percent, ShieldAlert, Users } from "lucide-react";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
@@ -92,7 +92,7 @@ export default async function GenerationResultsPage(props: PageProps<"/generate/
   return (
     <>
       <PageHeader
-        title={state.title}
+        title={state.lifecycleComplete ? "Your Leads" : state.title}
         description={`${state.niche} · ${state.locationLabel}`}
         actions={
           <Button variant="outline" size="sm" render={<Link href="/generate" />}>
@@ -113,7 +113,7 @@ export default async function GenerationResultsPage(props: PageProps<"/generate/
       />
 
       {/* ---- Headline figures ---- */}
-      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
           label="Total leads"
           value={formatNumber(state.search.leadsFound)}
@@ -127,12 +127,18 @@ export default async function GenerationResultsPage(props: PageProps<"/generate/
         <StatCard
           label="Emails found"
           value={formatNumber(state.enrichment.found)}
-          sublabel={`${formatNumber(state.enrichment.leadsWithWebsite)} of these businesses have a website`}
+          sublabel={`${formatNumber(state.enrichment.leadsWithWebsite)} of these have a website`}
           icon={Mail}
           tone={state.enrichment.found > 0 ? "positive" : undefined}
         />
         <StatCard
-          label="Area searched"
+          label="Google requests"
+          value={formatNumber(state.budget.used)}
+          sublabel={`${formatNumber(state.budget.quotaUsed)} / ${formatNumber(state.budget.quotaFreeLimit)} used this month`}
+          icon={Gauge}
+        />
+        <StatCard
+          label="Coverage"
           value={formatPercent(state.search.coveragePct, 1)}
           sublabel={
             state.search.fullyCovered
@@ -142,26 +148,29 @@ export default async function GenerationResultsPage(props: PageProps<"/generate/
           icon={Percent}
           tone={state.search.fullyCovered ? "positive" : "warning"}
         />
-        <StatCard
-          label="No public email"
-          value={formatNumber(state.enrichment.notFound)}
-          sublabel="checked, but no address published"
-          icon={MailX}
-        />
-        <StatCard
-          label="Could not be checked"
-          value={formatNumber(state.enrichment.failed)}
-          sublabel="the site blocked us or did not answer"
-          icon={MailX}
-          tone={state.enrichment.failed > 0 ? "warning" : undefined}
-        />
-        <StatCard
-          label="Google requests used"
-          value={formatNumber(state.budget.used)}
-          sublabel={`${formatNumber(state.budget.quotaRemaining)} left in this month's protected allowance`}
-          icon={Gauge}
-        />
       </div>
+
+      {/* The email outcomes worth knowing about, only when there are any. */}
+      {state.enrichment.notFound > 0 || state.enrichment.failed > 0 ? (
+        <div className="text-muted-foreground flex flex-wrap gap-x-8 gap-y-1 px-1 text-xs">
+          {state.enrichment.notFound > 0 ? (
+            <span>
+              No public email{" "}
+              <span className="text-foreground font-semibold tabular-nums">
+                {formatNumber(state.enrichment.notFound)}
+              </span>
+            </span>
+          ) : null}
+          {state.enrichment.failed > 0 ? (
+            <span>
+              Could not check{" "}
+              <span className="text-foreground font-semibold tabular-nums">
+                {formatNumber(state.enrichment.failed)}
+              </span>
+            </span>
+          ) : null}
+        </div>
+      ) : null}
 
       {/* ---- Completed in ---- */}
       <Card>
@@ -209,6 +218,16 @@ export default async function GenerationResultsPage(props: PageProps<"/generate/
           View search details
         </Button>
       </div>
+
+      {/* ---- The leads ---- */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-sm">Leads</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <ResultsLeadTable leads={leads} />
+        </CardContent>
+      </Card>
 
       {/* ---- Coverage ---- */}
       <Card>
@@ -267,16 +286,6 @@ export default async function GenerationResultsPage(props: PageProps<"/generate/
               </AccordionItem>
             </Accordion>
           )}
-        </CardContent>
-      </Card>
-
-      {/* ---- The leads ---- */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-sm">Leads</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <ResultsLeadTable leads={leads} />
         </CardContent>
       </Card>
 

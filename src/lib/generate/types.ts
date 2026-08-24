@@ -152,6 +152,12 @@ export type GenerationStopReason =
   | "enrichment_not_consented"
   /** The self-advancing loop stopped changing anything. See `maxNoProgressAdvances`. */
   | "no_progress"
+  /**
+   * The search can no longer be driven by this run -- it finished, was
+   * cancelled, or is otherwise not runnable. Distinct from losing a race for
+   * the lease, which is transient and never ends a generation.
+   */
+  | "search_unavailable"
   | "failed";
 
 /**

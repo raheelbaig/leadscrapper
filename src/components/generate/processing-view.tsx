@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { formatNumber, formatPercent } from "@/lib/format";
+import { requestAdvance } from "@/lib/generate/advance-client";
 import type { GenerationState, GenerationStep } from "@/lib/generate/types";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { cn } from "@/lib/utils";
@@ -44,22 +45,12 @@ import { cn } from "@/lib/utils";
  * ---------------------------------------------------------------------------
  */
 
-/**
- * Breathing room between slices.
- *
- * Not a rate limit -- the server owns every real limit. It keeps a run that is
- * ending, erroring, or briefly not progressing from becoming a tight request
- * loop before the server's own liveness guard has counted far enough to halt it.
- */
-const ADVANCE_GAP_MS = 400;
-
 export function ProcessingView({ initialState }: { initialState: GenerationState }) {
   const [state, setState] = useState<GenerationState>(initialState);
   const [error, setError] = useState<string | null>(null);
   const [stopping, setStopping] = useState(false);
   const [showTechnical, setShowTechnical] = useState(false);
 
-  const inFlight = useRef(false);
   const mounted = useRef(true);
   const router = useRouter();
 
@@ -86,49 +77,38 @@ export function ProcessingView({ initialState }: { initialState: GenerationState
   }, [runId]);
 
   // ---- the lifecycle loop -------------------------------------------------
-  // One request at a time, re-triggered by the state it produces, until the
-  // server stops saying there is more to do. Written as a reaction to state
-  // rather than a `while` loop so a stop, an error or a finished lifecycle ends
-  // it simply by being the new state.
+  // One advance at a time, re-triggered by the state it produces, until the
+  // server stops saying there is more to do.
   //
-  // Two concurrent advances are prevented by the database lease, not by the
-  // `inFlight` ref -- the ref only avoids a pointless request.
+  // The in-flight guard lives at MODULE scope in `requestAdvance`, not in a ref
+  // here. A ref is reset by React's effect cleanup -- which runs before every
+  // re-run and on every unmount -- so navigating away and back would start a
+  // second advance while the first was still executing on the server. That is
+  // precisely how a healthy 357-lead run came to be recorded as failed. Sharing
+  // the promise means a remount JOINS the request in progress instead of racing
+  // it, with no delay involved.
   useEffect(() => {
-    if (inFlight.current) return;
     if (state.status !== "running" || !state.canAdvance) return;
 
-    inFlight.current = true;
     let alive = true;
 
-    const timer = setTimeout(async () => {
-      try {
-        const response = await fetch(`/api/generate/${runId}/advance`, { method: "POST" });
-        const payload = await response.json();
+    void requestAdvance(runId).then((outcome) => {
+      if (!alive || !mounted.current) return;
 
-        if (!response.ok) {
-          if (alive && mounted.current) {
-            setError(payload.error ?? "We could not continue this generation.");
-          }
-          return;
-        }
-
-        if (alive && mounted.current) {
-          setError(null);
-          setState(payload as GenerationState);
-        }
-      } catch (cause) {
-        if (alive && mounted.current) {
-          setError(cause instanceof Error ? cause.message : String(cause));
-        }
-      } finally {
-        inFlight.current = false;
+      if (!outcome.ok) {
+        setError(outcome.error);
+        return;
       }
-    }, ADVANCE_GAP_MS);
+
+      setError(null);
+      setState(outcome.state);
+    });
 
     return () => {
+      // Stops THIS component reacting. It deliberately does not cancel the
+      // request or clear the registry: the server keeps working either way, and
+      // forgetting about it is what caused the overlap.
       alive = false;
-      clearTimeout(timer);
-      inFlight.current = false;
     };
   }, [state, runId]);
 
@@ -236,6 +216,27 @@ export function ProcessingView({ initialState }: { initialState: GenerationState
               </span>
             ) : null}
           </div>
+
+          {/*
+           * THE FOUR FIGURES THAT MATTER WHILE IT RUNS.
+           *
+           * Leads and emails are what the user came for; Google requests and
+           * area searched are what tell them how far along it is and what it is
+           * costing. Everything else -- sections, tiles, budgets, quota
+           * mechanics -- is under Technical details.
+           */}
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <Figure label="Leads found" value={formatNumber(state.search.leadsFound)} />
+            <Figure label="Emails found" value={formatNumber(state.enrichment.found)} />
+            <Figure
+              label="Google requests"
+              value={`${formatNumber(state.budget.used)} / ${formatNumber(state.budget.ceiling)}`}
+              hint={`${formatNumber(state.budget.quotaUsed)} / ${formatNumber(state.budget.quotaFreeLimit)} this month`}
+            />
+            <Figure label="Area searched" value={formatPercent(state.search.coveragePct, 0)} />
+          </div>
+
+          <Progress value={Math.min(state.search.coveragePct, 100)} />
 
           <ol className="space-y-2.5">
             {state.steps.map((step) => (

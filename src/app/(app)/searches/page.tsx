@@ -19,20 +19,54 @@ import {
 import { formatDate, formatNumber, formatPercent } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { listSearches } from "@/server/db/queries/dashboard";
+import { getCurrentUser, getSupabaseServerClient } from "@/server/db/server-client";
 
 export const metadata: Metadata = { title: "Searches" };
 
+export const dynamic = "force-dynamic";
+
+/**
+ * Search history, kept.
+ *
+ * Looking up what you found last week is a normal thing to want, so this stays
+ * in the primary navigation. What changed is where it points: a search that
+ * still has a generation attached opens THAT generation, so a run the user
+ * navigated away from is never stranded behind a raw search-detail view. Rows
+ * without one keep going to the technical detail page, which still has the
+ * coverage map, the section table and the activity log.
+ */
 export default async function SearchesPage() {
-  const searches = await listSearches();
+  const [searches, user] = await Promise.all([listSearches(), getCurrentUser()]);
+
+  // The newest generation per search, so each row can link to the right place.
+  const supabase = await getSupabaseServerClient();
+  const { data: runs } = user
+    ? await supabase
+        .from("generation_runs")
+        .select("id, search_id, status, created_at")
+        .order("created_at", { ascending: false })
+    : { data: [] };
+
+  const runBySearch = new Map<string, { id: string; status: string }>();
+  for (const run of runs ?? []) {
+    if (!runBySearch.has(run.search_id)) runBySearch.set(run.search_id, run);
+  }
+
+  /** Where a row should go: its generation if it has one, else the detail view. */
+  const hrefFor = (searchId: string) => {
+    const run = runBySearch.get(searchId);
+    if (!run) return `/searches/${searchId}`;
+    return run.status === "running" ? `/generate/${run.id}` : `/generate/${run.id}/results`;
+  };
 
   return (
     <>
       <PageHeader
-        title="Searches"
-        description="Every search is a durable job that finishes when its area is covered — the lead target is a minimum, not a stopping point. Pausing, closing the browser, or a server restart does not lose progress."
+        title="Active searches"
+        description="Everything you have generated, newest first. A search finishes when its whole area has been searched — the lead target is a minimum, not a stopping point."
         actions={
-          <Link href="/find-leads" className={buttonVariants({ size: "lg" })}>
-            Find New Leads
+          <Link href="/generate" className={buttonVariants({ size: "lg" })}>
+            Generate New Leads
           </Link>
         }
       />
@@ -41,9 +75,9 @@ export default async function SearchesPage() {
         <EmptyState
           icon={Search}
           title="No searches yet"
-          description="Your first search will tile the city, work through the tiles on the server, and report exactly how much of the area it managed to cover."
-          actionLabel="Find New Leads"
-          actionHref="/find-leads"
+          description="Generate your first set of leads and it will appear here, with the businesses it found and how much of the area it searched."
+          actionLabel="Generate New Leads"
+          actionHref="/generate"
         />
       ) : (
         <Card className="overflow-hidden py-0">
@@ -66,7 +100,7 @@ export default async function SearchesPage() {
                   {searches.map((s) => (
                     <TableRow key={s.id} className="cursor-pointer">
                       <TableCell className="font-medium">
-                        <Link href={`/searches/${s.id}`} className="hover:underline">
+                        <Link href={hrefFor(s.id)} className="hover:underline">
                           {s.niche}
                         </Link>
                       </TableCell>

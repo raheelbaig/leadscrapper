@@ -42,17 +42,17 @@ const FRIENDLY: Record<string, FriendlyEmailStatus> = {
     tone: "positive",
   },
   not_found: {
-    label: "No public email found",
+    label: "No public email",
     detail: "We checked their website and it does not publish a contact address.",
     tone: "neutral",
   },
   failed: {
-    label: "Could not check website",
+    label: "Could not check",
     detail: "Their website blocked us or did not respond. You can try again.",
     tone: "warning",
   },
   queued: {
-    label: "Not checked yet",
+    label: "Not checked",
     detail: "This business is waiting to be checked.",
     tone: "neutral",
   },

@@ -1,14 +1,4 @@
-import {
-  Download,
-  Gauge,
-  LayoutDashboard,
-  Mail,
-  MapPinned,
-  Search,
-  Settings,
-  Sparkles,
-  Users,
-} from "lucide-react";
+import { LayoutDashboard, Search, Sparkles, Users } from "lucide-react";
 
 export type NavItem = {
   href: string;
@@ -24,57 +14,47 @@ export type NavSection = {
 };
 
 /**
- * Navigation, ordered by how often a normal day needs it.
+ * Three destinations. That is the whole product.
  *
- * The normal path is Generate Leads -> the processing screen -> the results
- * page, and none of the steps in between are navigation the user has to
- * perform. Everything under "Advanced" still works and is still linked to from
- * the results page; those pages became history and detail views rather than
- * stops on the way to a lead list.
+ * WHAT IS DELIBERATELY ABSENT, and where it went:
+ *
+ *   Enrichment  -- email discovery is automatic now. A page for running it by
+ *                  hand is a page for doing the orchestrator's job, and its
+ *                  operator-level detail (providers, attempts, batches,
+ *                  robots.txt) is not something a user should have to learn.
+ *   API Usage   -- the numbers still matter, so they moved to where the
+ *                  spending happens: the generate form, the processing screen
+ *                  and the results page all show requests used against the
+ *                  limit. A dedicated page made a routine figure feel like an
+ *                  admin console.
+ *   Exports     -- the workbook button now sits directly above the leads it
+ *                  exports. Sending someone to another page to collect a file
+ *                  they just asked for is a step with no purpose.
+ *   Manual Search / Settings -- building a search by hand and editing grid
+ *                  defaults are power-user tools, not steps in getting leads.
+ *
+ * NONE OF THOSE ROUTES WERE DELETED, and no service behind them changed. They
+ * are reachable by URL and still work; they are simply not decisions a
+ * first-time user is asked to make. Search history stays in the primary nav
+ * because looking up what you found last week is a normal thing to want.
  */
 export const NAV_SECTIONS: NavSection[] = [
   {
     label: "Overview",
     items: [
       {
-        href: "/dashboard",
-        label: "Dashboard",
-        icon: LayoutDashboard,
-        hint: "Everything at a glance",
-      },
-      {
         href: "/generate",
         label: "Generate Leads",
         icon: Sparkles,
         hint: "Niche, area, and one button",
       },
-      { href: "/leads", label: "Leads", icon: Users, hint: "Every business you have found" },
-    ],
-  },
-  {
-    label: "Advanced",
-    items: [
       {
         href: "/searches",
-        label: "Search History",
+        label: "Active Searches",
         icon: Search,
-        hint: "Coverage maps, sections and activity logs",
+        hint: "Everything you have run, past and present",
       },
-      { href: "/exports", label: "Exports", icon: Download, hint: "Every workbook you generated" },
-      { href: "/enrichment", label: "Enrichment", icon: Mail, hint: "Email discovery status" },
-      { href: "/usage", label: "API Usage", icon: Gauge, hint: "Free quota and spend protection" },
-      {
-        href: "/settings",
-        label: "Settings",
-        icon: Settings,
-        hint: "Grid defaults and saved areas",
-      },
-      {
-        href: "/find-leads",
-        label: "Manual Search",
-        icon: MapPinned,
-        hint: "Build a search by hand, run it tick by tick",
-      },
+      { href: "/leads", label: "Leads", icon: Users, hint: "Every business you have found" },
     ],
   },
 ];

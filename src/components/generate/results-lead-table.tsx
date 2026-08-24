@@ -149,8 +149,7 @@ export function ResultsLeadTable({ leads }: { leads: ResultLead[] }) {
                 active={sortKey === "email"}
                 onClick={() => toggleSort("email")}
               />
-              <TableHead>Status</TableHead>
-              <TableHead className="text-right">Confidence</TableHead>
+              <TableHead>Email status</TableHead>
               <SortableHead
                 label="City"
                 active={sortKey === "city"}
@@ -190,11 +189,6 @@ export function ResultsLeadTable({ leads }: { leads: ResultLead[] }) {
                 </TableCell>
                 <TableCell>
                   <FriendlyStatus status={lead.emailStatus} />
-                </TableCell>
-                <TableCell className="text-muted-foreground text-right text-xs tabular-nums">
-                  {lead.emailConfidence === null
-                    ? "—"
-                    : `${Math.round(lead.emailConfidence * 100)}%`}
                 </TableCell>
                 <TableCell className="text-muted-foreground text-xs">{lead.city ?? "—"}</TableCell>
                 <TableCell className="text-muted-foreground text-xs">{lead.state ?? "—"}</TableCell>
