@@ -19,7 +19,7 @@ import {
   AccordionTrigger,
 } from "@/components/ui/accordion";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { formatNumber, formatPercent } from "@/lib/format";
 import type { GenerationDisplayState } from "@/lib/generate/types";
 import { getCurrentUser, getSupabaseServerClient } from "@/server/db/server-client";
@@ -150,27 +150,55 @@ export default async function GenerationResultsPage(props: PageProps<"/generate/
         />
       </div>
 
-      {/* The email outcomes worth knowing about, only when there are any. */}
-      {state.enrichment.notFound > 0 || state.enrichment.failed > 0 ? (
-        <div className="text-muted-foreground flex flex-wrap gap-x-8 gap-y-1 px-1 text-xs">
-          {state.enrichment.notFound > 0 ? (
-            <span>
-              No public email{" "}
-              <span className="text-foreground font-semibold tabular-nums">
-                {formatNumber(state.enrichment.notFound)}
-              </span>
+      {/*
+       * THE EMAIL OUTCOMES, AND WHY THEY MUST ALL BE SHOWN.
+       *
+       * A real run reported 204 found, 111 with no public address and 77
+       * unreachable. Those sum to 392 -- every lead that HAD a website -- while
+       * the other 93 had none at all and appeared only as "Not checked". A user
+       * adding the first three up was left with 93 apparently outstanding on a
+       * run that had genuinely finished. Naming the website-less bucket is what
+       * makes the arithmetic close.
+       */}
+      <div className="text-muted-foreground flex flex-wrap gap-x-8 gap-y-1 px-1 text-xs">
+        <span>
+          Emails found{" "}
+          <span className="text-foreground font-semibold tabular-nums">
+            {formatNumber(state.enrichment.found)}
+          </span>
+        </span>
+        <span>
+          No public email{" "}
+          <span className="text-foreground font-semibold tabular-nums">
+            {formatNumber(state.enrichment.notFound)}
+          </span>
+        </span>
+        <span>
+          Could not check{" "}
+          <span className="text-foreground font-semibold tabular-nums">
+            {formatNumber(state.enrichment.failed)}
+          </span>
+        </span>
+        <span>
+          No website{" "}
+          <span className="text-foreground font-semibold tabular-nums">
+            {formatNumber(state.enrichment.leadsWithoutWebsite)}
+          </span>
+        </span>
+        {state.enrichment.remaining > 0 ? (
+          <span>
+            Still to check{" "}
+            <span className="text-foreground font-semibold tabular-nums">
+              {formatNumber(state.enrichment.remaining)}
             </span>
-          ) : null}
-          {state.enrichment.failed > 0 ? (
-            <span>
-              Could not check{" "}
-              <span className="text-foreground font-semibold tabular-nums">
-                {formatNumber(state.enrichment.failed)}
-              </span>
-            </span>
-          ) : null}
-        </div>
-      ) : null}
+          </span>
+        ) : null}
+      </div>
+
+      <p className="text-muted-foreground px-1 text-xs">
+        A business with no website has nothing to check — Google returns no email address at any
+        tier, so the site is the only place a public one could be found.
+      </p>
 
       {/* ---- Completed in ---- */}
       <Card>
@@ -203,6 +231,127 @@ export default async function GenerationResultsPage(props: PageProps<"/generate/
         </CardContent>
       </Card>
 
+      {/* ---- SEARCH AREA ---- */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-sm">Search area</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <p className="text-base font-medium">{state.area.label}</p>
+
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <Figure
+              label="Selected area"
+              value={`${formatNumber(Math.round(state.area.totalKm2))} km²`}
+            />
+            <Figure label="Coverage" value={formatPercent(state.area.coveragePct, 1)} />
+            <Figure
+              label="Searched"
+              value={`${formatNumber(Math.round(state.area.searchedKm2))} km²`}
+            />
+            <Figure
+              label="Remaining"
+              value={`${formatNumber(Math.round(state.area.remainingKm2))} km²`}
+            />
+          </div>
+
+          {state.area.fullyCovered ? (
+            <p className="flex items-center gap-2 text-sm text-emerald-700 dark:text-emerald-400">
+              <CheckCircle2 className="size-4" />
+              Entire selected area searched
+            </p>
+          ) : (
+            <p className="text-muted-foreground text-sm">
+              Some of the selected area still needs to be searched.
+            </p>
+          )}
+
+          <Accordion>
+            <AccordionItem value="bounds">
+              <AccordionTrigger className="text-sm">Area details</AccordionTrigger>
+              <AccordionContent className="text-muted-foreground space-y-3 text-sm">
+                {/*
+                 * The EXACT persisted rectangle, not a description of the city.
+                 * While external boundary lookups are off, this comes from a
+                 * stored bounding box for the area, so it is labelled as the
+                 * area that was selected and searchable rather than implying
+                 * every square kilometre of the metro is inside it.
+                 */}
+                <p>
+                  This is the rectangle the search was built from. It is the area that was selected
+                  and searched — not necessarily every part of the wider metro area.
+                </p>
+                <dl className="grid grid-cols-2 gap-x-8 gap-y-1 font-mono text-xs sm:grid-cols-4">
+                  <Bound label="North" value={state.area.bounds.north} />
+                  <Bound label="South" value={state.area.bounds.south} />
+                  <Bound label="East" value={state.area.bounds.east} />
+                  <Bound label="West" value={state.area.bounds.west} />
+                </dl>
+                <p>
+                  Divided into {formatNumber(state.search.areasTotal)} sections, of which{" "}
+                  {formatNumber(state.search.areasSearched)} were searched
+                  {state.search.areasRemaining > 0
+                    ? ` and ${formatNumber(state.search.areasRemaining)} were not`
+                    : ""}
+                  .
+                </p>
+                {!state.search.fullyCovered ? (
+                  <p>
+                    A search ends when its whole area has been covered. This one stopped earlier —
+                    usually on the limit for how many Google requests a single search may make — and
+                    the part it did not reach is recorded rather than quietly dropped.
+                  </p>
+                ) : null}
+              </AccordionContent>
+            </AccordionItem>
+          </Accordion>
+        </CardContent>
+      </Card>
+
+      {/* ---- REQUEST USAGE ---- */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-sm">Request usage</CardTitle>
+          <CardDescription>
+            Google Places and business-website checks are different things and are counted
+            separately.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <Figure
+              label="Google Places"
+              value={`${formatNumber(state.requests.googlePlacesThisSearch)} / ${formatNumber(state.requests.googleSearchBudget)}`}
+              hint="this search"
+            />
+            <Figure
+              label="Monthly Google"
+              value={`${formatNumber(state.requests.googleMonthlyUsed)} / ${formatNumber(state.requests.googleMonthlyLimit)}`}
+              hint="free usage only"
+            />
+            <Figure
+              label="Website checks"
+              value={formatNumber(state.requests.websitesChecked)}
+              hint="business sites read for an email"
+            />
+            <Figure
+              label="Geocoding"
+              value={formatNumber(state.requests.geocoding)}
+              hint="turned off"
+            />
+          </div>
+
+          <p className="text-muted-foreground text-xs">
+            Website checks are ordinary requests to the businesses&rsquo; own sites — they are not
+            Google usage and cost nothing. Third-party email lookup services:{" "}
+            <span className="text-foreground font-medium">
+              {formatNumber(state.requests.thirdPartyEmail)}
+            </span>{" "}
+            — this product does not use any.
+          </p>
+        </CardContent>
+      </Card>
+
       {/* ---- Actions. Export is the primary one. ---- */}
       <div className="flex flex-wrap items-center gap-3">
         <ExportExcelButton searchId={state.searchId} leadCount={leads.length} />
@@ -226,66 +375,6 @@ export default async function GenerationResultsPage(props: PageProps<"/generate/
         </CardHeader>
         <CardContent>
           <ResultsLeadTable leads={leads} />
-        </CardContent>
-      </Card>
-
-      {/* ---- Coverage ---- */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-sm">Coverage</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <div className="flex flex-wrap gap-x-8 gap-y-1 text-sm">
-            <span className="text-muted-foreground">
-              Area searched{" "}
-              <span className="text-foreground font-semibold tabular-nums">
-                {formatPercent(state.search.coveragePct, 1)}
-              </span>
-            </span>
-            <span className="text-muted-foreground">
-              Remaining area{" "}
-              <span className="text-foreground font-semibold tabular-nums">
-                {formatPercent(Math.max(100 - state.search.coveragePct, 0), 1)}
-              </span>
-            </span>
-            <span className="text-muted-foreground">
-              Sections{" "}
-              <span className="text-foreground font-semibold tabular-nums">
-                {formatNumber(state.search.areasSearched)} / {formatNumber(state.search.areasTotal)}
-              </span>
-            </span>
-          </div>
-
-          {state.search.fullyCovered ? (
-            <p className="text-muted-foreground text-sm">
-              Every section of the selected area was searched.
-            </p>
-          ) : (
-            <Accordion>
-              <AccordionItem value="why">
-                <AccordionTrigger className="text-sm">
-                  Why isn&rsquo;t coverage 100%?
-                </AccordionTrigger>
-                <AccordionContent className="text-muted-foreground space-y-2 text-sm">
-                  <p>
-                    Your area is divided into sections and each one is searched separately, so we
-                    always know exactly which parts have been looked at. This generation ended
-                    before reaching every section — usually because it reached the limit on how many
-                    Google requests one search may make.
-                  </p>
-                  <p>
-                    Nothing was skipped silently. {formatNumber(state.search.areasRemaining)}{" "}
-                    section(s) covering {state.search.areaOwedKm2.toFixed(1)} km² are still owed and
-                    still recorded.
-                  </p>
-                  <p>
-                    Finding more leads than you asked for does not end a search. The target is a
-                    minimum; the area being covered is what finishes it.
-                  </p>
-                </AccordionContent>
-              </AccordionItem>
-            </Accordion>
-          )}
         </CardContent>
       </Card>
 
@@ -435,5 +524,28 @@ function OutcomeBanner({
         </p>
       </CardContent>
     </Card>
+  );
+}
+
+/** One labelled figure. */
+function Figure({ label, value, hint }: { label: string; value: string; hint?: string }) {
+  return (
+    <div className="space-y-0.5">
+      <p className="text-muted-foreground text-[11px] font-medium tracking-wide uppercase">
+        {label}
+      </p>
+      <p className="text-base font-semibold tabular-nums">{value}</p>
+      {hint ? <p className="text-muted-foreground text-[11px]">{hint}</p> : null}
+    </div>
+  );
+}
+
+/** One edge of the persisted rectangle, shown to six decimal places as stored. */
+function Bound({ label, value }: { label: string; value: number }) {
+  return (
+    <div>
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd className="text-foreground tabular-nums">{value.toFixed(4)}</dd>
+    </div>
   );
 }

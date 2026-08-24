@@ -6,6 +6,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { downloadExport } from "@/lib/generate/download-export";
 import { formatNumber, formatPercent } from "@/lib/format";
 
 /**
@@ -26,6 +27,7 @@ export function ExportExcelButton({
 }) {
   const [busy, setBusy] = useState(false);
   const [exportId, setExportId] = useState<string | null>(null);
+  const [downloading, setDownloading] = useState(false);
   const router = useRouter();
 
   async function generate() {
@@ -59,11 +61,41 @@ export function ExportExcelButton({
     }
   }
 
+  async function startDownload(id: string) {
+    setDownloading(true);
+    try {
+      const outcome = await downloadExport(id);
+
+      // SUCCESS MEANS THE FILE ARRIVED, not that a link was minted. The old
+      // code announced success as soon as the export row existed, which is how
+      // a toast came to appear over a download that never happened.
+      if (!outcome.ok) {
+        toast.error("The download did not complete", { description: outcome.error });
+        return;
+      }
+
+      toast.success("Excel downloaded successfully.", {
+        description: `${outcome.filename} · ${formatNumber(Math.round(outcome.bytes / 1024))} KB`,
+      });
+    } finally {
+      setDownloading(false);
+    }
+  }
+
   if (exportId) {
     return (
-      <Button size="lg" className="gap-2" onClick={() => download(exportId)}>
-        <Download className="size-4" />
-        Download Excel
+      <Button
+        size="lg"
+        className="gap-2"
+        onClick={() => startDownload(exportId)}
+        disabled={downloading}
+      >
+        {downloading ? (
+          <Loader2 className="size-4 animate-spin" />
+        ) : (
+          <Download className="size-4" />
+        )}
+        {downloading ? "Downloading…" : "Download Excel"}
       </Button>
     );
   }
@@ -74,20 +106,6 @@ export function ExportExcelButton({
       {busy ? "Building…" : leadCount === 0 ? "Nothing to export" : "Export Excel"}
     </Button>
   );
-}
-
-/**
- * A real document request, not a client-side navigation. The download route
- * replies 307 to a short-lived signed Storage URL; letting the Next router
- * "navigate" there would try to render the .xlsx as a page.
- */
-function download(exportId: string): void {
-  const anchor = document.createElement("a");
-  anchor.href = `/api/exports/${exportId}/download`;
-  anchor.rel = "noopener";
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
 }
 
 /**

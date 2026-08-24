@@ -317,7 +317,7 @@ export function ProcessingView({ initialState }: { initialState: GenerationState
               <Figure
                 label="Still to check"
                 value={formatNumber(state.enrichment.remaining)}
-                hint={`${formatNumber(state.enrichment.failed)} could not be checked`}
+                hint={`${formatNumber(state.enrichment.failed)} could not be checked · ${formatNumber(state.enrichment.leadsWithoutWebsite)} have no website`}
               />
               <Figure
                 label="Elapsed in this step"

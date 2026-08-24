@@ -283,7 +283,7 @@ describe.skipIf(!ENABLED)("guided generation orchestration", () => {
   }
 
   /** Stands in for one real enrichment batch. Reaches nothing. */
-  function makeEnrichmentFake(counters: { calls: number }) {
+  function makeEnrichmentFake(counters: { calls: number }, batchSizes?: number[]) {
     return async function fakeEnrichment(args: {
       userId: string;
       searchId?: string;
@@ -303,6 +303,10 @@ describe.skipIf(!ENABLED)("guided generation orchestration", () => {
         .neq("website", "")
         .order("created_at")
         .limit(limit);
+
+      // Recorded so a test can prove the loop really ran in several bounded
+      // rounds rather than one unbounded pass.
+      batchSizes?.push((candidates ?? []).length);
 
       let found = 0;
       for (const [index, lead] of (candidates ?? []).entries()) {
@@ -324,7 +328,7 @@ describe.skipIf(!ENABLED)("guided generation orchestration", () => {
         await db.from("lead_enrichment_attempts").insert({
           user_id: args.userId,
           lead_id: lead.id,
-          provider: "fake",
+          provider: "website",
           status: isFound ? "found" : "not_found",
           email: isFound ? `hello+${lead.id}@example.invalid` : null,
           duration_ms: 4_000,
@@ -716,7 +720,7 @@ describe.skipIf(!ENABLED)("guided generation orchestration", () => {
         await db.from("lead_enrichment_attempts").insert({
           user_id: args.userId,
           lead_id: id,
-          provider: "fake",
+          provider: "website",
           status: "failed",
           duration_ms: 3_600,
           cost_units: 0,
@@ -1127,6 +1131,355 @@ describe.skipIf(!ENABLED)("guided generation orchestration", () => {
   // -------------------------------------------------------------------------
   // Nothing real was touched
   // -------------------------------------------------------------------------
+
+  // -------------------------------------------------------------------------
+  // Search area and request transparency
+  // -------------------------------------------------------------------------
+
+  /**
+   * THE SELECTED AREA COMES FROM THE PERSISTED ROW.
+   *
+   * Not a label typed into the UI and not a coordinate invented for display:
+   * the user has to be able to answer "which part of the city did it search?"
+   * and be told the truth.
+   */
+  // -------------------------------------------------------------------------
+  // The completion rule: what "finished" means for email discovery
+  // -------------------------------------------------------------------------
+
+  /**
+   * COVERAGE COMPLETE IS NOT LIFECYCLE COMPLETE.
+   *
+   * A search whose whole area has been covered still has work to do while a
+   * lead with a website has never been looked at. This is the rule that keeps
+   * "Your Leads" off a run that has not finished.
+   */
+  it("is not complete while a lead with a website is still unchecked", async () => {
+    const created = await createRun({ enrichEmails: true, testBbox: SMALL_BOX });
+
+    // Search the whole area, but never let enrichment run.
+    const searchOnly = {
+      runTick: makeTickFake({ asked: [] }),
+      runEnrichment: (async () => {
+        throw new Error("enrichment must not run in this case");
+      }) as never,
+    };
+
+    let state = await stateModule.loadGenerationState({ runId: created.runId, userId });
+    for (let i = 0; i < 20 && state.phase === "searching"; i += 1) {
+      state = await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, searchOnly);
+    }
+
+    // Geography done...
+    expect(state.search.fullyCovered).toBe(true);
+    // ...but the run is NOT ready, and says so.
+    expect(state.phase).toBe("enriching");
+    expect(state.status).toBe("running");
+    expect(state.lifecycleComplete).toBe(false);
+    expect(state.title).not.toMatch(/ready/i);
+    expect(state.enrichment.remaining).toBeGreaterThan(0);
+    expect(state.canAdvance).toBe(true);
+  });
+
+  /**
+   * The batch loop runs itself to exhaustion. The fake processes a small,
+   * bounded slice each time -- exactly as the real service does -- so reaching
+   * zero requires several rounds with no button in between.
+   */
+  it("works through every eligible lead in bounded batches, unattended", async () => {
+    const created = await createRun({ enrichEmails: true, testBbox: LARGE_BOX });
+
+    const batchSizes: number[] = [];
+    const deps = {
+      runTick: makeTickFake({ asked: [] }),
+      runEnrichment: makeEnrichmentFake({ calls: 0 }, batchSizes),
+    };
+
+    let state = await stateModule.loadGenerationState({ runId: created.runId, userId });
+    for (let i = 0; i < 200 && state.status === "running" && state.canAdvance; i += 1) {
+      state = await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
+    }
+
+    // Several batches, each within the per-advance cap.
+    expect(batchSizes.length).toBeGreaterThan(2);
+    for (const size of batchSizes) {
+      expect(size).toBeLessThanOrEqual(GENERATION_LIMITS.enrichmentLeadsPerAdvance);
+    }
+
+    // Every lead with a website reached a terminal state.
+    const { count: stillPending } = await db
+      .from("leads")
+      .select("id", { count: "exact", head: true })
+      .eq("search_id", created.searchId)
+      .eq("email_status", "not_enriched")
+      .not("website", "is", null)
+      .neq("website", "");
+    expect(stillPending).toBe(0);
+
+    // And only then is it ready.
+    expect(state.lifecycleComplete).toBe(true);
+    expect(state.title).toBe("Your leads are ready");
+    expect(state.stopReason).toBe("generation_complete");
+  });
+
+  /**
+   * THE REGRESSION FOR THE 93.
+   *
+   * A lead with no website can never be checked -- Google returns no email at
+   * any tier, so the site is the only bridge to one. Those leads must not hold
+   * the lifecycle open, and must not be counted as outstanding.
+   */
+  it("does not let website-less leads block completion", async () => {
+    const created = await createRun({ enrichEmails: true, testBbox: SMALL_BOX });
+    const deps = {
+      runTick: makeTickFake({ asked: [] }),
+      runEnrichment: makeEnrichmentFake({ calls: 0 }),
+    };
+
+    // One slice of searching, then strip the websites off half the leads --
+    // the shape Google really returns.
+    await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
+    const { data: leads } = await db.from("leads").select("id").eq("search_id", created.searchId);
+    const half = (leads ?? []).slice(0, Math.floor((leads ?? []).length / 2)).map((l) => l.id);
+    await db.from("leads").update({ website: null }).in("id", half);
+
+    let state = await stateModule.loadGenerationState({ runId: created.runId, userId });
+    for (let i = 0; i < 60 && state.status === "running" && state.canAdvance; i += 1) {
+      state = await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
+    }
+
+    // Finished, with the website-less leads still `not_enriched` in the table.
+    expect(state.lifecycleComplete).toBe(true);
+    expect(state.enrichment.leadsWithoutWebsite).toBe(half.length);
+
+    const { count: untouched } = await db
+      .from("leads")
+      .select("id", { count: "exact", head: true })
+      .eq("search_id", created.searchId)
+      .eq("email_status", "not_enriched");
+    expect(untouched).toBe(half.length);
+
+    // They are NOT reported as outstanding work.
+    expect(state.enrichment.remaining).toBe(0);
+  });
+
+  it("treats found, not_found and failed alike as finished", async () => {
+    const created = await createRun({ enrichEmails: true, testBbox: SMALL_BOX });
+
+    // A fake that produces all three terminal outcomes.
+    const mixed = (async (args: { userId: string; searchId?: string; limit?: number }) => {
+      const { data: candidates } = await db
+        .from("leads")
+        .select("id")
+        .eq("search_id", args.searchId!)
+        .eq("email_status", "not_enriched")
+        .not("website", "is", null)
+        .neq("website", "")
+        .order("created_at")
+        .limit(args.limit ?? 5);
+
+      const ids = (candidates ?? []).map((c) => c.id);
+      const outcomes = ["found", "not_found", "failed"] as const;
+      for (const [index, id] of ids.entries()) {
+        await db
+          .from("leads")
+          .update({
+            email_status: outcomes[index % 3],
+            email: index % 3 === 0 ? `x${index}@example.invalid` : null,
+            email_checked_at: new Date().toISOString(),
+          })
+          .eq("id", id);
+      }
+
+      const { count: remaining } = await db
+        .from("leads")
+        .select("id", { count: "exact", head: true })
+        .eq("search_id", args.searchId!)
+        .eq("email_status", "not_enriched")
+        .not("website", "is", null)
+        .neq("website", "");
+
+      return {
+        dryRun: false,
+        mode: "new",
+        selected: ids.length,
+        processed: ids.length,
+        found: 0,
+        notFound: 0,
+        failed: 0,
+        remaining: remaining ?? 0,
+        scope: null as never,
+        results: [],
+      };
+    }) as unknown as typeof import("@/server/enrichment/run-enrichment").runEnrichment;
+
+    const deps = { runTick: makeTickFake({ asked: [] }), runEnrichment: mixed };
+
+    let state = await stateModule.loadGenerationState({ runId: created.runId, userId });
+    for (let i = 0; i < 60 && state.status === "running" && state.canAdvance; i += 1) {
+      state = await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
+    }
+
+    // A run containing failures is still a finished run.
+    expect(state.lifecycleComplete).toBe(true);
+    expect(state.enrichment.failed).toBeGreaterThan(0);
+    expect(state.enrichment.remaining).toBe(0);
+  });
+
+  it("does not let a remount cut enrichment short", async () => {
+    const created = await createRun({ enrichEmails: true, testBbox: LARGE_BOX });
+    const deps = {
+      runTick: makeTickFake({ asked: [] }),
+      runEnrichment: makeEnrichmentFake({ calls: 0 }),
+    };
+
+    let state = await stateModule.loadGenerationState({ runId: created.runId, userId });
+    for (let i = 0; i < 60 && state.phase !== "enriching"; i += 1) {
+      state = await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
+    }
+    // Part-way through the email phase.
+    state = await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
+    expect(state.enrichment.remaining).toBeGreaterThan(0);
+
+    // The user navigates away and comes back: the state is simply re-read.
+    const reopened = await stateModule.loadGenerationState({ runId: created.runId, userId });
+    expect(reopened.status).toBe("running");
+    expect(reopened.canAdvance).toBe(true);
+    expect(reopened.lifecycleComplete).toBe(false);
+    expect(reopened.phase).toBe("enriching");
+
+    // And it picks up exactly where it left off.
+    let resumed = reopened;
+    for (let i = 0; i < 200 && resumed.status === "running" && resumed.canAdvance; i += 1) {
+      resumed = await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
+    }
+    expect(resumed.lifecycleComplete).toBe(true);
+  });
+
+  it("never counts a productive email batch as no progress", async () => {
+    const created = await createRun({ enrichEmails: true, testBbox: LARGE_BOX });
+    const deps = {
+      runTick: makeTickFake({ asked: [] }),
+      runEnrichment: makeEnrichmentFake({ calls: 0 }),
+    };
+
+    let state = await stateModule.loadGenerationState({ runId: created.runId, userId });
+    for (let i = 0; i < 200 && state.status === "running" && state.canAdvance; i += 1) {
+      state = await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
+
+      const { data: row } = await db
+        .from("generation_runs")
+        .select("no_progress_ticks")
+        .eq("id", created.runId)
+        .single();
+      // Real work happened every round, so the liveness guard stays at zero.
+      expect(row!.no_progress_ticks).toBe(0);
+    }
+
+    expect(state.stopReason).toBe("generation_complete");
+  });
+
+  it("reports the search area from the stored rectangle, not from a label", async () => {
+    const created = await createRun({ enrichEmails: false, testBbox: SMALL_BOX });
+
+    const state = await stateModule.loadGenerationState({ runId: created.runId, userId });
+
+    // Straight from `searches`, which `createSearch` wrote from the resolved box.
+    const { data: search } = await db
+      .from("searches")
+      .select(
+        "label, area_total_km2, area_covered_km2, coverage_pct, min_lat, min_lng, max_lat, max_lng",
+      )
+      .eq("id", created.searchId)
+      .single();
+
+    expect(state.area.label).toBe(search!.label);
+    expect(state.area.totalKm2).toBe(search!.area_total_km2);
+    expect(state.area.searchedKm2).toBe(search!.area_covered_km2);
+    expect(state.area.coveragePct).toBe(search!.coverage_pct);
+
+    // The exact rectangle, to the value stored.
+    expect(state.area.bounds).toEqual({
+      north: search!.max_lat,
+      south: search!.min_lat,
+      east: search!.max_lng,
+      west: search!.min_lng,
+    });
+    // And it is the box that was actually asked for.
+    expect(state.area.bounds.north).toBe(SMALL_BOX.maxLat);
+    expect(state.area.bounds.west).toBe(SMALL_BOX.minLng);
+
+    // Nothing searched yet: all of it is still owed, and the arithmetic adds up.
+    expect(state.area.searchedKm2).toBe(0);
+    expect(state.area.remainingKm2).toBeCloseTo(state.area.totalKm2, 6);
+    expect(state.area.fullyCovered).toBe(false);
+  });
+
+  it("reports 100% coverage and no remaining area once the whole box is searched", async () => {
+    const created = await createRun({ enrichEmails: false, testBbox: SMALL_BOX });
+    const deps = {
+      runTick: makeTickFake({ asked: [] }),
+      runEnrichment: makeEnrichmentFake({ calls: 0 }),
+    };
+
+    let state = await stateModule.loadGenerationState({ runId: created.runId, userId });
+    for (let i = 0; i < 20 && state.status === "running" && state.canAdvance; i += 1) {
+      state = await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
+    }
+
+    expect(state.area.coveragePct).toBe(100);
+    expect(state.area.fullyCovered).toBe(true);
+    expect(state.area.remainingKm2).toBeCloseTo(0, 6);
+    expect(state.area.searchedKm2).toBeCloseTo(state.area.totalKm2, 6);
+  });
+
+  /**
+   * GOOGLE AND WEBSITE CHECKS ARE DIFFERENT THINGS.
+   *
+   * The header used to read "API 188 / 950", which said neither whose API nor
+   * against what. These keep the categories apart and keep the denominators
+   * honest.
+   */
+  it("counts Google calls and website checks separately", async () => {
+    const created = await createRun({ enrichEmails: true, testBbox: SMALL_BOX });
+    const deps = {
+      runTick: makeTickFake({ asked: [] }),
+      runEnrichment: makeEnrichmentFake({ calls: 0 }),
+    };
+
+    let state = await stateModule.loadGenerationState({ runId: created.runId, userId });
+    for (let i = 0; i < 30 && state.status === "running" && state.canAdvance; i += 1) {
+      state = await orchestrator.advanceGenerationRun({ runId: created.runId, userId }, deps);
+    }
+
+    const { data: search } = await db
+      .from("searches")
+      .select("api_calls_run")
+      .eq("id", created.searchId)
+      .single();
+
+    // Google: this search's own billable calls, against the per-search ceiling.
+    expect(state.requests.googlePlacesThisSearch).toBe(search!.api_calls_run);
+    expect(state.requests.googleSearchBudget).toBe(SEARCH_LIMITS.maxCallsPerSearch);
+
+    // The MONTHLY denominator is the full free allowance, never the internal
+    // protected figure that produced "/ 950".
+    expect(state.requests.googleMonthlyLimit).toBe(1_000);
+    expect(state.requests.googleMonthlyUsed).toBeLessThanOrEqual(state.requests.googleMonthlyLimit);
+
+    // Website checks are counted from recorded attempts, and are a DIFFERENT
+    // number from the Google calls.
+    const { count: attempts } = await db
+      .from("lead_enrichment_attempts")
+      .select("id, leads!inner(search_id)", { count: "exact", head: true })
+      .eq("leads.search_id", created.searchId);
+    expect(state.requests.websitesChecked).toBe(attempts ?? 0);
+    expect(state.requests.websitesChecked).toBeGreaterThan(0);
+
+    // The categories that do not exist stay at zero.
+    expect(state.requests.geocoding).toBe(0);
+    expect(state.requests.thirdPartyEmail).toBe(0);
+  });
 
   it("leaves the month's Google allowance exactly as it found it", async () => {
     const { data: counters } = await db.from("api_usage_counters").select("*").order("sku");

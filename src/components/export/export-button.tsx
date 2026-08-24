@@ -6,6 +6,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { downloadExport } from "@/lib/generate/download-export";
 import { formatNumber, formatPercent } from "@/lib/format";
 
 /**
@@ -51,10 +52,7 @@ export function ExportSearchButton({
         action: {
           label: "Download",
           onClick: () => {
-            // A real document request, not a client-side navigation. The route
-            // answers 307 to a short-lived signed Storage URL, and letting the
-            // Next router "navigate" to it would try to render it as a page.
-            triggerDownload(payload.exportId);
+            void triggerDownload(payload.exportId);
           },
         },
       });
@@ -84,34 +82,43 @@ export function ExportSearchButton({
 }
 
 /**
- * Fetches the workbook as a document rather than navigating to it.
+ * Fetches the workbook and hands it to the browser.
  *
- * The download route replies 307 to a short-lived signed Storage URL. That is a
- * file transfer, not a page, so it must not go through the Next.js router --
- * `router.push` would try to treat the .xlsx as a route and the download would
- * never start. A detached anchor click is the plain-browser primitive for this.
+ * Shared with the results page through `downloadExport`, so the advanced
+ * Exports view and the normal flow cannot drift apart -- and so neither can
+ * report success for a download that did not happen.
  */
-function triggerDownload(exportId: string): void {
-  const anchor = document.createElement("a");
-  anchor.href = `/api/exports/${exportId}/download`;
-  anchor.rel = "noopener";
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
+async function triggerDownload(exportId: string): Promise<void> {
+  const outcome = await downloadExport(exportId);
+  if (!outcome.ok) {
+    toast.error("The download did not complete", { description: outcome.error });
+    return;
+  }
+  toast.success("Excel downloaded successfully.", { description: outcome.filename });
 }
 
 /** Re-download for an already-generated workbook. */
 export function DownloadExportButton({ exportId, label }: { exportId: string; label: string }) {
+  const [busy, setBusy] = useState(false);
+
   return (
     <Button
       variant="ghost"
       size="sm"
       className="gap-1.5"
-      onClick={() => triggerDownload(exportId)}
+      disabled={busy}
+      onClick={async () => {
+        setBusy(true);
+        try {
+          await triggerDownload(exportId);
+        } finally {
+          setBusy(false);
+        }
+      }}
       aria-label={`Download ${label}`}
     >
-      <Download className="size-3.5" />
-      Download
+      {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Download className="size-3.5" />}
+      {busy ? "Downloading…" : "Download"}
     </Button>
   );
 }

@@ -1,14 +1,16 @@
 import "server-only";
 
-import { PLACES_FIELD_MASK } from "@/lib/constants";
+import { GEOCODING_URL, PLACES_FIELD_MASK } from "@/lib/constants";
 import { buildCoverageReport, type CoverageTile } from "@/lib/coverage-report";
 import { WORST_CASE_LEAD_MS, WORST_CASE_TILE_MS } from "@/lib/generate/calibration";
 import { elapsedSeconds, estimateRemaining } from "@/lib/generate/eta";
 import type {
+  GenerationArea,
   GenerationBudget,
   GenerationDisplayState,
   GenerationEnrichmentProgress,
   GenerationSearchProgress,
+  GenerationRequests,
   GenerationState,
   GenerationStep,
 } from "@/lib/generate/types";
@@ -271,6 +273,70 @@ export async function buildGenerationState(
     quotaFreeLimit: quota.freeLimit,
   };
 
+  // ---------------------------------------------------------------------
+  // The rectangle that was searched, straight from the persisted row.
+  // ---------------------------------------------------------------------
+  const totalKm2 = search.area_total_km2 ?? 0;
+  const searchedKm2 = search.area_covered_km2 ?? 0;
+
+  const area: GenerationArea = {
+    label: search.label,
+    totalKm2,
+    searchedKm2,
+    remainingKm2: Math.max(totalKm2 - searchedKm2, 0),
+    coveragePct: search.coverage_pct,
+    fullyCovered: coverage.fullyCovered,
+    // The exact bbox the grid was built from. Never rounded here -- the display
+    // decides its own precision, and inventing coordinates is the one thing an
+    // "area details" panel must not do.
+    bounds: {
+      north: search.max_lat,
+      south: search.min_lat,
+      east: search.max_lng,
+      west: search.min_lng,
+    },
+  };
+
+  // ---------------------------------------------------------------------
+  // Outbound requests, by who received them.
+  // ---------------------------------------------------------------------
+  const [{ count: websitesChecked }, { count: geocodingCalls }, { count: thirdPartyEmail }] =
+    await Promise.all([
+      // Recorded attempts against THIS search's leads: one per business looked
+      // at. The provider may fetch several pages per attempt, but that count is
+      // not persisted, so it is not reported as though it were.
+      db
+        .from("lead_enrichment_attempts")
+        .select("id, leads!inner(search_id)", { count: "exact", head: true })
+        .eq("leads.search_id", run.search_id)
+        .eq("user_id", run.user_id),
+      // From the billing ledger rather than from a constant, so this stops
+      // reading zero the moment a geocoding request is ever actually made.
+      db
+        .from("api_call_log")
+        .select("id", { count: "exact", head: true })
+        .eq("endpoint", GEOCODING_URL),
+      // Any enrichment attempt not made by the website reader. There is no such
+      // provider, and this is what would notice if one appeared.
+      db
+        .from("lead_enrichment_attempts")
+        .select("id", { count: "exact", head: true })
+        .neq("provider", "website"),
+    ]);
+
+  const requests: GenerationRequests = {
+    googlePlacesThisSearch: search.api_calls_run,
+    googleSearchBudget: SEARCH_LIMITS.maxCallsPerSearch,
+    googleMonthlyUsed: quota.used,
+    // The FULL free allowance. Deliberately not `effectiveLimit`, which is the
+    // allowance minus an internal safety reserve -- showing that as the
+    // denominator is what made the header read "188 / 950".
+    googleMonthlyLimit: quota.freeLimit,
+    websitesChecked: websitesChecked ?? 0,
+    geocoding: geocodingCalls ?? 0,
+    thirdPartyEmail: thirdPartyEmail ?? 0,
+  };
+
   const described = describeRun({
     run,
     search: searchProgress,
@@ -300,6 +366,8 @@ export async function buildGenerationState(
     search: searchProgress,
     enrichment: enrichmentProgress,
     budget,
+    area,
+    requests,
   };
 }
 

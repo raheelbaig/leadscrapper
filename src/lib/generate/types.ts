@@ -86,6 +86,61 @@ export type GenerationBudget = {
   quotaFreeLimit: number;
 };
 
+/**
+ * The rectangle that was actually searched, in the user's terms.
+ *
+ * Every figure comes from the persisted search row -- `area_total_km2`,
+ * `area_covered_km2` and the four bbox columns written when the grid was laid
+ * down. Nothing here is a label typed by hand or a coordinate invented for
+ * display, which is what lets the page answer "which part of Houston did it
+ * actually search?" truthfully.
+ */
+export type GenerationArea = {
+  /** The resolved location label, e.g. "Houston, Texas, United States". */
+  label: string;
+  totalKm2: number;
+  searchedKm2: number;
+  remainingKm2: number;
+  coveragePct: number;
+  fullyCovered: boolean;
+  /** The exact persisted rectangle. */
+  bounds: { north: number; south: number; east: number; west: number };
+};
+
+/**
+ * Outbound requests, separated by who actually received them.
+ *
+ * THE HEADER USED TO SAY "API 188 / 950", which conflated three unrelated
+ * things: it mixed the monthly Google counter with an internal protected
+ * allowance, and said nothing at all about the hundreds of ordinary HTTP
+ * requests email discovery makes to business websites. These fields keep the
+ * categories apart so no figure can be mistaken for another.
+ *
+ * Supabase, Storage, Realtime and traffic between this application's own routes
+ * are NOT counted anywhere here. They are not product API usage and never
+ * appear in `api_call_log`.
+ */
+export type GenerationRequests = {
+  /** Billable Google Places calls made by THIS search. */
+  googlePlacesThisSearch: number;
+  /** The per-search ceiling those sit inside. */
+  googleSearchBudget: number;
+  /** The month's Google total, across every search. */
+  googleMonthlyUsed: number;
+  /** The full free monthly allowance -- not the internal protected figure. */
+  googleMonthlyLimit: number;
+  /**
+   * Business websites checked for a contact address, counted from recorded
+   * enrichment attempts. One attempt is one business looked at; the number of
+   * individual HTTP requests behind it is not persisted, so it is not claimed.
+   */
+  websitesChecked: number;
+  /** Geocoding requests ever recorded. Structurally zero: the providers are off. */
+  geocoding: number;
+  /** Requests to a paid email-lookup provider. Structurally zero: none exists. */
+  thirdPartyEmail: number;
+};
+
 export type GenerationState = {
   runId: string;
   searchId: string;
@@ -120,6 +175,8 @@ export type GenerationState = {
   search: GenerationSearchProgress;
   enrichment: GenerationEnrichmentProgress;
   budget: GenerationBudget;
+  area: GenerationArea;
+  requests: GenerationRequests;
 };
 
 /**

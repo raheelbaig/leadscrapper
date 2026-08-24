@@ -2,7 +2,6 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { Gauge } from "lucide-react";
-import Link from "next/link";
 
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -12,15 +11,26 @@ import type { UsageOverview } from "@/lib/types/usage";
 import { cn } from "@/lib/utils";
 
 /**
- * The always-visible quota reading in the application shell.
+ * The always-visible Google usage reading in the application shell.
  *
- * Reads the database through `/api/usage?summary=1` -- no chart, no per-run
- * breakdown, and above all no Google request. Nothing here contacts Google to
- * find out how much Google quota is left; the counter in Postgres is the only
- * thing the budget guard trusts, so it is the only thing displayed.
+ * ---------------------------------------------------------------------------
+ * IT SAYS WHOSE API IT IS, AND COUNTS AGAINST THE REAL ALLOWANCE.
  *
- * It shows the SKU every lead search actually bills against, which is the one
- * that runs out first.
+ * This used to read `API 188 / 950`, which was wrong twice over. "API" gave no
+ * hint which API -- and by far the most numerous outbound requests this product
+ * makes are the ordinary website reads of email discovery, which are not
+ * Google, not billed, and not counted here at all. And 950 is the free
+ * allowance minus an internal safety reserve, so the denominator was a number
+ * the user has no reason to recognise and never agreed to.
+ *
+ * It now reads `Google 188 / 1,000` against the real monthly free allowance,
+ * with the reserve explained in the tooltip where it belongs. The full
+ * breakdown -- Google versus website checks versus geocoding -- lives on the
+ * results page, next to the run that caused it.
+ *
+ * Still no Google request is made to produce this. The counter in Postgres is
+ * the only thing the budget guard trusts, so it is the only thing displayed.
+ * ---------------------------------------------------------------------------
  */
 export function QuotaIndicator() {
   const { data, isPending, isError } = useQuery<UsageOverview>({
@@ -51,30 +61,36 @@ export function QuotaIndicator() {
     <Tooltip>
       <TooltipTrigger
         render={
-          <Link
-            href="/usage"
-            aria-label={`API usage: ${primary.used} of ${primary.effectiveLimit} calls used. ${meta.label}.`}
-            className="hover:bg-muted hidden items-center gap-1.5 rounded-md border px-2 py-1 text-xs transition-colors sm:flex"
+          <span
+            aria-label={`Google API usage: ${primary.used} of ${primary.freeLimit} free monthly requests used. ${meta.label}.`}
+            className="hidden items-center gap-1.5 rounded-md border px-2 py-1 text-xs sm:flex"
           />
         }
       >
         <Gauge className={cn("size-3.5", meta.textClass)} />
-        <span className="text-muted-foreground">API</span>
+        <span className="text-muted-foreground">Google</span>
         <span className="font-medium tabular-nums">
           {formatNumber(primary.used)}
-          <span className="text-muted-foreground"> / {formatNumber(primary.effectiveLimit)}</span>
+          <span className="text-muted-foreground"> / {formatNumber(primary.freeLimit)}</span>
+        </span>
+        <span className="text-muted-foreground border-l pl-1.5 text-[10px] tracking-wide uppercase">
+          Free only
         </span>
       </TooltipTrigger>
-      <TooltipContent className="max-w-64 space-y-1">
-        <p className="font-medium">
-          {primary.label} — {data.period.label}
-        </p>
+      <TooltipContent className="max-w-72 space-y-1">
+        <p className="font-medium">Google Places — {data.period.label}</p>
         <p>
-          {formatNumber(primary.remaining)} of {formatNumber(primary.effectiveLimit)} protected
-          calls remaining. {formatNumber(primary.reserve)} of the {formatNumber(primary.freeLimit)}
-          -call free allowance is held back as a safety reserve.
+          {formatNumber(primary.used)} of the {formatNumber(primary.freeLimit)} free monthly
+          requests used. Only free usage is ever made.
         </p>
-        <p className="text-muted-foreground">{meta.description}</p>
+        <p className="text-muted-foreground">
+          Business-website checks for email discovery are not counted here — they are ordinary
+          requests to those sites and cost nothing.
+        </p>
+        <p className="text-muted-foreground">
+          {formatNumber(primary.reserve)} requests are held back as a safety reserve, so searching
+          stops at {formatNumber(primary.effectiveLimit)}.
+        </p>
       </TooltipContent>
     </Tooltip>
   );

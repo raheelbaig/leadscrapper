@@ -188,7 +188,7 @@ export function ResultsLeadTable({ leads }: { leads: ResultLead[] }) {
                   )}
                 </TableCell>
                 <TableCell>
-                  <FriendlyStatus status={lead.emailStatus} />
+                  <FriendlyStatus status={lead.emailStatus} website={lead.website} />
                 </TableCell>
                 <TableCell className="text-muted-foreground text-xs">{lead.city ?? "—"}</TableCell>
                 <TableCell className="text-muted-foreground text-xs">{lead.state ?? "—"}</TableCell>
@@ -280,8 +280,10 @@ function SortableHead({
  * normal user should not have to learn what `not_enriched` means to read their
  * own lead list.
  */
-function FriendlyStatus({ status }: { status: string }) {
-  const meta = friendlyEmailStatus(status);
+function FriendlyStatus({ status, website }: { status: string; website: string | null }) {
+  // The website decides whether `not_enriched` means "still to do" or "nothing
+  // to do" -- see `friendlyEmailStatus`.
+  const meta = friendlyEmailStatus(status, Boolean(website && website.trim() !== ""));
 
   return (
     <Badge

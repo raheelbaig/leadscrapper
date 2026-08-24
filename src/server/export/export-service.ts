@@ -273,6 +273,58 @@ export async function createSearchExport(
  * Minted server-side against a PRIVATE bucket, after re-checking ownership.
  * Nothing about the object is public and no link outlives its TTL.
  */
+/**
+ * The stored workbook's bytes, for serving as a real file response.
+ *
+ * Goes through the Storage SDK rather than fetching a signed URL ourselves. The
+ * safety envelope keeps an explicit allow-list of the files permitted to call
+ * `fetch` -- currently the Places client and the website reader, both of which
+ * reach hosts we do not own -- and adding the export route to it would widen a
+ * rule that exists to make an unrestricted server-side fetcher impossible in a
+ * process holding a service-role key. `download()` needs no such privilege: the
+ * SDK talks to our own project, and the path is one this function just proved
+ * belongs to the caller.
+ *
+ * The bucket stays PRIVATE and no URL ever reaches the browser.
+ */
+export async function getExportFile(
+  args: { exportId: string; userId: string },
+  db: AdminDb = getSupabaseAdminClient(),
+): Promise<{ bytes: ArrayBuffer; label: string }> {
+  const { data: row, error } = await db
+    .from("exports")
+    .select("id, label, status, storage_path")
+    .eq("id", args.exportId)
+    .eq("user_id", args.userId)
+    .maybeSingle();
+
+  if (error) throw new Error(`Could not load the export: ${error.message}`);
+  if (!row) throw new ExportError("Export not found.", 404);
+  if (row.status !== "ready" || !row.storage_path) {
+    throw new ExportError(`This export is ${row.status}; there is no file to download.`, 409);
+  }
+
+  const { data: blob, error: downloadError } = await db.storage
+    .from(EXPORTS_BUCKET)
+    .download(row.storage_path);
+
+  if (downloadError || !blob) {
+    throw new ExportError(
+      `The stored file could not be read: ${downloadError?.message ?? "no data returned"}`,
+      502,
+    );
+  }
+
+  const bytes = await blob.arrayBuffer();
+  if (bytes.byteLength === 0) {
+    // A zero-byte workbook is a failed export wearing a success status. Saying
+    // so beats handing the user an unopenable file.
+    throw new ExportError("The stored file is empty.", 502);
+  }
+
+  return { bytes, label: row.label };
+}
+
 export async function getExportDownloadUrl(
   args: { exportId: string; userId: string },
   db: AdminDb = getSupabaseAdminClient(),
